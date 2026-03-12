@@ -16,7 +16,7 @@ from backend.models.database import get_db
 logger = logging.getLogger(__name__)
 
 # Default CSV location
-DEFAULT_CSV_PATH = str(Path.home() / "Desktop" / "CONSTRUCTION_RELEVANT_APIS.csv")
+DEFAULT_CSV_PATH = str(Path(__file__).parent.parent / "data" / "CONSTRUCTION_RELEVANT_APIS.csv")
 
 # Top 50 US metro areas for T1 (daily sync) prioritization
 TOP_METROS = frozenset([

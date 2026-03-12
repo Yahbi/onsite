@@ -124,7 +124,9 @@ BACKEND_CACHE_FILE = str(_BASE_DIR / "backend" / "data_cache.json")
 BACKEND_LEADS_DB = str(_BASE_DIR / "backend" / "leads.db")
 CACHE_DURATION = timedelta(hours=6)  # Refresh every 6 hours
 # US nationwide permit sources/ingest (free/open only)
-US_DATA_DIR = _BASE_DIR / "DATA" / "US"
+# Use backend/data/ for runtime data — works in Docker and locally
+US_DATA_DIR = _BASE_DIR / "backend" / "data"
+US_DATA_DIR.mkdir(parents=True, exist_ok=True)
 US_SOURCES_JSON = US_DATA_DIR / "permit_sources.json"
 US_PERMITS_CSV = US_DATA_DIR / "permits_ingested.csv"
 US_DISCOVERY_LOG = US_DATA_DIR / "permit_sources_discovery.log"
@@ -1641,8 +1643,12 @@ async def startup_event():
     # Don't block startup, run sync in background
     asyncio.create_task(sync_data())
 
-# Mount static files (frontend)
-app.mount("/static", StaticFiles(directory=str(_BASE_DIR / "static")), name="static")
+# Mount static files (frontend) — backend/static/ has all HTML/CSS/JS
+_BACKEND_STATIC = _BASE_DIR / "backend" / "static"
+if _BACKEND_STATIC.exists():
+    app.mount("/static", StaticFiles(directory=str(_BACKEND_STATIC)), name="static")
+else:
+    logger.warning(f"Static directory not found: {_BACKEND_STATIC}")
 
 _STATIC_DIR = _BASE_DIR / "backend" / "static"
 

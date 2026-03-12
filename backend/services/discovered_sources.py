@@ -15,8 +15,9 @@ from dataclasses import dataclass, field, asdict
 logger = logging.getLogger(__name__)
 
 # Paths to discovery output files
-DISCOVERY_CSV = Path.home() / "Desktop" / "MASTER_US_BUILDING_PERMIT_APIS.csv"
-DISCOVERY_CACHE = Path.home() / "Desktop" / "openclaw_validated_datasets.json"
+_DATA_DIR = Path(__file__).parent.parent / "data"
+DISCOVERY_CSV = _DATA_DIR / "MASTER_US_BUILDING_PERMIT_APIS.csv"
+DISCOVERY_CACHE = _DATA_DIR / "openclaw_validated_datasets.json"
 
 
 @dataclass

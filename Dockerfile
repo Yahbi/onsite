@@ -18,6 +18,9 @@ COPY main.py ./
 COPY backend/ ./backend/
 COPY backend/static ./static
 
+# Ensure runtime data directories exist
+RUN mkdir -p backend/data backend/static
+
 # Railway sets PORT env var — app reads it at runtime
 ENV PORT=8080
 
@@ -26,5 +29,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=30s \
     CMD curl -f http://localhost:${PORT}/api/health || exit 1
 
-# Run main.py from repo root — it serves backend/static/* for the React SPA
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 2 --loop uvloop --http httptools"]
+# Single worker on Railway to save memory — uvloop + httptools for speed
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 1 --loop uvloop --http httptools"]

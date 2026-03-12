@@ -43,7 +43,7 @@ backend/.tile_cache/
 .claude/
 
 # Old/archived folders — not part of Onsite app
-DATA/
+/DATA/
 GC App/
 Onsite data/
 Permit Pulse/
@@ -58,8 +58,9 @@ tests/
 tmp_map_hooks.txt
 la_response.txt
 
-# Large CSVs
+# Large CSVs (except the API sources catalog)
 *.csv
+!backend/data/CONSTRUCTION_RELEVANT_APIS.csv
 
 # Compiled/cached
 *.pyc
