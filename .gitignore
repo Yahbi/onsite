@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+.venv3/
+.venv_run/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files (keep .env.example, not .env)
+.env
+
+# Large data files — regenerated at runtime, not in git
+data_cache.json
+backend/data_cache.json
+*.db
+*.db-shm
+*.db-wal
+
+# Tile cache
+backend/.tile_cache/
+
+# Claude internal
+.claude/
+
+# Old/archived folders — not part of Onsite app
+DATA/
+GC App/
+Onsite data/
+Permit Pulse/
+Permit Pulse data/
+Permit Pulse docs/
+Dataset free Permit & Parcel Data/
+UI/
+bridge/
+ca-lead-engine/
+system_audit/
+tests/
+tmp_map_hooks.txt
+la_response.txt
+
+# Large CSVs
+*.csv
+
+# Compiled/cached
+*.pyc
+node_modules/
+
+# Archives
+*.zip
+*.dmg
+
+# Logs
+*.log

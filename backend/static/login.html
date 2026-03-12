@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Onsite — Sign In</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box }
+    body { font-family:'DM Sans',system-ui,sans-serif; background:#0f172a; color:#fff; min-height:100vh; display:flex; align-items:center; justify-content:center }
+    .bg { position:fixed; inset:0; background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 50%,#0f172a 100%); z-index:0 }
+    .bg::after { content:''; position:absolute; inset:0; background:radial-gradient(ellipse at 70% 20%,rgba(61,139,122,.15),transparent 60%),radial-gradient(ellipse at 30% 80%,rgba(37,99,235,.1),transparent 50%) }
+    .container { position:relative; z-index:1; width:100%; max-width:420px; padding:20px }
+    .brand { text-align:center; margin-bottom:32px }
+    .brand-icon { display:inline-flex; width:48px; height:48px; background:linear-gradient(135deg,#3d8b7a,#267063); border-radius:12px; align-items:center; justify-content:center; font-weight:800; font-size:18px; color:#fff; margin-bottom:12px }
+    .brand h1 { font-size:28px; font-weight:800; letter-spacing:-1px }
+    .brand p { font-size:14px; color:#94a3b8; margin-top:4px }
+    .card { background:#fff; border-radius:16px; padding:36px 32px; box-shadow:0 25px 60px rgba(0,0,0,.4) }
+    .card-title { font-size:20px; font-weight:700; color:#0f172a; margin-bottom:4px }
+    .card-sub { font-size:13px; color:#64748b; margin-bottom:24px }
+    .field { margin-bottom:16px }
+    .field label { display:block; font-size:12px; font-weight:600; color:#334155; margin-bottom:6px }
+    .field input { width:100%; padding:12px 14px; border:1.5px solid #e2e8f0; border-radius:10px; font-size:14px; font-family:inherit; color:#0f172a; outline:none; transition:border .15s }
+    .field input:focus { border-color:#3d8b7a; box-shadow:0 0 0 3px rgba(61,139,122,.12) }
+    .field input::placeholder { color:#94a3b8 }
+    .reg-fields { display:none }
+    .reg-fields.show { display:block }
+    .btn-primary { width:100%; padding:14px; background:#267063; color:#fff; border:none; border-radius:10px; font-size:15px; font-weight:700; cursor:pointer; font-family:inherit; transition:all .15s }
+    .btn-primary:hover { background:#1f5c52; transform:translateY(-1px); box-shadow:0 4px 12px rgba(38,112,99,.3) }
+    .btn-primary:disabled { opacity:.6; cursor:not-allowed; transform:none }
+    .btn-google { display:flex; align-items:center; justify-content:center; gap:10px; width:100%; padding:12px; background:#fff; color:#333; border:1.5px solid #e2e8f0; border-radius:10px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; transition:all .15s; text-decoration:none; margin-bottom:8px }
+    .btn-google:hover { background:#f8fafc; border-color:#cbd5e1; transform:translateY(-1px); box-shadow:0 2px 8px rgba(0,0,0,.08) }
+    .btn-google svg { width:18px; height:18px }
+    .divider { display:flex; align-items:center; gap:12px; margin:20px 0; color:#94a3b8; font-size:12px }
+    .divider::before,.divider::after { content:''; flex:1; height:1px; background:#e2e8f0 }
+    .toggle-link { display:block; text-align:center; font-size:13px; color:#64748b; cursor:pointer; padding:4px 8px }
+    .toggle-link:hover { color:#267063 }
+    .toggle-link b { color:#267063; font-weight:700 }
+    .forgot-link { display:block; text-align:center; font-size:12px; color:#94a3b8; cursor:pointer; padding:4px 8px; margin-top:4px }
+    .forgot-link:hover { color:#267063 }
+    .alert { padding:10px 14px; border-radius:8px; font-size:13px; margin-bottom:16px; display:none }
+    .alert-error { background:#fef2f2; color:#991b1b; border:1px solid #fecaca }
+    .alert-success { background:#f0fdf4; color:#166534; border:1px solid #bbf7d0 }
+    .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:32px }
+    .stat { text-align:center; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.08); border-radius:10px; padding:14px 8px }
+    .stat-num { font-size:22px; font-weight:800; color:#3d8b7a }
+    .stat-label { font-size:10px; color:#64748b; font-weight:600; text-transform:uppercase; letter-spacing:.3px; margin-top:2px }
+    .hidden { display:none !important }
+  </style>
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="container">
+    <div class="brand">
+      <div class="brand-icon">OS</div>
+      <h1>Onsite</h1>
+      <p>Contractor Lead Intelligence</p>
+    </div>
+
+    <div class="card">
+      <div class="card-title" id="cardTitle">Sign In</div>
+      <div class="card-sub" id="cardSub">Access your lead dashboard</div>
+
+      <div id="alertError" class="alert alert-error"></div>
+      <div id="alertSuccess" class="alert alert-success"></div>
+
+      <!-- ── Google Sign In ── -->
+      <a href="/api/auth/google" class="btn-google" id="googleBtn">
+        <svg viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+        Sign in with Google
+      </a>
+
+      <div class="divider" id="dividerTop">or</div>
+
+      <!-- ── Login / Register Form ── -->
+      <form id="authForm">
+        <div class="reg-fields" id="regFields">
+          <div class="field">
+            <label>Full Name</label>
+            <input type="text" id="fullName" placeholder="John Smith" />
+          </div>
+          <div class="field">
+            <label>Company</label>
+            <input type="text" id="company" placeholder="Acme Construction" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Email</label>
+          <input type="email" id="email" placeholder="you@company.com" required />
+        </div>
+        <div class="field" id="passwordField">
+          <label>Password</label>
+          <input type="password" id="password" placeholder="Min 8 characters" minlength="8" required />
+        </div>
+
+        <button type="submit" class="btn-primary" id="submitBtn">Sign In</button>
+      </form>
+
+      <!-- ── Forgot Password Form ── -->
+      <form id="forgotForm" class="hidden">
+        <div class="field">
+          <label>Email</label>
+          <input type="email" id="forgotEmail" placeholder="you@company.com" required />
+        </div>
+        <button type="submit" class="btn-primary" id="forgotBtn">Send Reset Link</button>
+      </form>
+
+      <!-- ── Reset Password Form ── -->
+      <form id="resetForm" class="hidden">
+        <div class="field">
+          <label>New Password</label>
+          <input type="password" id="newPassword" placeholder="Min 8 characters" minlength="8" required />
+        </div>
+        <div class="field">
+          <label>Confirm Password</label>
+          <input type="password" id="confirmPassword" placeholder="Confirm password" minlength="8" required />
+        </div>
+        <button type="submit" class="btn-primary" id="resetBtn">Reset Password</button>
+      </form>
+
+      <div class="divider">or</div>
+      <div class="toggle-link" id="toggleLink" onclick="toggleMode()">
+        Don't have an account? <b>Register</b>
+      </div>
+      <div class="forgot-link" id="forgotLink" onclick="showForgot()">
+        Forgot your password?
+      </div>
+      <div style="display:flex;gap:16px;justify-content:center;margin-top:12px;font-size:13px;">
+        <a href="/" style="color:#64748b;text-decoration:none;">Back to homepage</a>
+        <a href="#" onclick="localStorage.setItem('onsite_token','demo');window.location.href='/app';return false;" style="color:#0f766e;text-decoration:none;font-weight:600;">Try Live Demo</a>
+      </div>
+    </div>
+
+    <div class="stats" id="liveStats">
+      <div class="stat"><div class="stat-num" id="s-leads">—</div><div class="stat-label">Active Leads</div></div>
+      <div class="stat"><div class="stat-num" id="s-cities">—</div><div class="stat-label">Cities</div></div>
+      <div class="stat"><div class="stat-num" id="s-value">—</div><div class="stat-label">Pipeline</div></div>
+    </div>
+  </div>
+
+  <script>
+    const API = window.location.origin;
+    let isRegister = false;
+    let currentView = 'login';
+    let pendingResetToken = null;
+
+    const urlParams = new URLSearchParams(window.location.search);
+
+    // ── Handle Google OAuth callback ──
+    const googleToken = urlParams.get('token');
+    const authType = urlParams.get('auth');
+    if (googleToken && authType === 'google') {
+      localStorage.setItem('onsite_token', googleToken);
+      // Fetch user profile and store it
+      (async () => {
+        try {
+          const r = await fetch(API + '/api/auth/me', {
+            headers: { 'Authorization': 'Bearer ' + googleToken }
+          });
+          if (r.ok) {
+            const d = await r.json();
+            const userObj = d.user || d;
+            localStorage.setItem('onsite_user', JSON.stringify(userObj));
+            // If opened as popup from index.html, send postMessage back
+            if (window.opener) {
+              window.opener.postMessage({
+                type: 'google-auth-success',
+                token: googleToken,
+                user: userObj
+              }, window.location.origin);
+              window.close();
+              return;
+            }
+          }
+        } catch(e) {}
+        // If not a popup, redirect normally
+        if (window.opener) {
+          window.opener.postMessage({ type: 'google-auth-error', error: 'Failed to fetch profile' }, window.location.origin);
+          window.close();
+        } else {
+          window.location.href = '/app';
+        }
+      })();
+    }
+
+    // ── Handle email verification from URL ──
+    const verifyToken = urlParams.get('verify_token');
+    if (verifyToken) {
+      (async () => {
+        try {
+          const r = await fetch(API + '/api/auth/verify-email', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: verifyToken })
+          });
+          const d = await r.json();
+          if (r.ok) {
+            show('alertSuccess', 'Email verified! You can now sign in.');
+          } else {
+            show('alertError', d.detail || 'Verification failed');
+          }
+        } catch(e) {
+          show('alertError', 'Verification request failed');
+        }
+      })();
+    }
+
+    // ── Handle OAuth errors ──
+    const oauthError = urlParams.get('error');
+    if (oauthError) {
+      const errorMessages = {
+        'oauth_not_configured': 'Google sign-in is not yet configured.',
+        'oauth_failed': 'Google sign-in failed. Please try again.',
+        'no_user_info': 'Could not get your Google account info.',
+        'no_email': 'No email found in your Google account.',
+        'server_error': 'Server error during sign-in. Please try again.',
+      };
+      setTimeout(() => show('alertError', errorMessages[oauthError] || 'Sign-in error'), 100);
+    }
+
+    // Redirect if already logged in
+    const tok = localStorage.getItem('onsite_token');
+    if (tok && tok !== 'demo' && !googleToken) window.location.href = '/app';
+
+    // Check for reset token in URL
+    const resetToken = urlParams.get('reset_token');
+    if (resetToken) {
+      pendingResetToken = resetToken;
+      setTimeout(() => showResetForm(), 100);
+    }
+
+    // Load live stats
+    (async () => {
+      try {
+        const r = await fetch(API + '/api/health');
+        const d = await r.json();
+        const count = d.total_leads || d.leads_count || 0;
+        if (count > 0) {
+          document.getElementById('s-leads').textContent = count >= 1e6 ? (count/1e6).toFixed(1)+'M' : count >= 1e3 ? Math.round(count/1e3)+'K' : count;
+        }
+        const r2 = await fetch(API + '/api/enrich/stats');
+        const d2 = await r2.json();
+        if (d2.cities) document.getElementById('s-cities').textContent = d2.cities;
+      } catch(e) {}
+    })();
+
+    function show(id, msg) { const el = document.getElementById(id); el.textContent = msg; el.style.display = 'block'; }
+    function hide(id) { document.getElementById(id).style.display = 'none'; }
+
+    function setView(view) {
+      currentView = view;
+      document.getElementById('authForm').classList.toggle('hidden', view === 'forgot' || view === 'reset');
+      document.getElementById('forgotForm').classList.toggle('hidden', view !== 'forgot');
+      document.getElementById('resetForm').classList.toggle('hidden', view !== 'reset');
+      document.getElementById('forgotLink').classList.toggle('hidden', view === 'forgot' || view === 'reset');
+      document.getElementById('googleBtn').classList.toggle('hidden', view === 'forgot' || view === 'reset');
+      document.getElementById('dividerTop').classList.toggle('hidden', view === 'forgot' || view === 'reset');
+      hide('alertError'); hide('alertSuccess');
+    }
+
+    function toggleMode() {
+      if (currentView === 'forgot' || currentView === 'reset') {
+        setView('login');
+        isRegister = false;
+      } else {
+        isRegister = !isRegister;
+      }
+      document.getElementById('regFields').classList.toggle('show', isRegister);
+      document.getElementById('cardTitle').textContent = isRegister ? 'Create Account' : 'Sign In';
+      document.getElementById('cardSub').textContent = isRegister ? 'Start finding leads in minutes' : 'Access your lead dashboard';
+      document.getElementById('submitBtn').textContent = isRegister ? 'Create Account' : 'Sign In';
+      document.getElementById('toggleLink').innerHTML = isRegister
+        ? 'Already have an account? <b>Sign In</b>'
+        : "Don't have an account? <b>Register</b>";
+      setView(isRegister ? 'register' : 'login');
+      document.getElementById('authForm').classList.remove('hidden');
+    }
+
+    function showForgot() {
+      setView('forgot');
+      document.getElementById('cardTitle').textContent = 'Reset Password';
+      document.getElementById('cardSub').textContent = 'Enter your email to receive a reset link';
+      document.getElementById('toggleLink').innerHTML = 'Back to <b>Sign In</b>';
+    }
+
+    function showResetForm() {
+      setView('reset');
+      document.getElementById('cardTitle').textContent = 'Set New Password';
+      document.getElementById('cardSub').textContent = 'Choose a new password for your account';
+      document.getElementById('toggleLink').innerHTML = 'Back to <b>Sign In</b>';
+    }
+
+    // ── Login / Register ──
+    document.getElementById('authForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      hide('alertError'); hide('alertSuccess');
+      const btn = document.getElementById('submitBtn');
+      btn.disabled = true;
+      btn.textContent = isRegister ? 'Creating...' : 'Signing in...';
+
+      try {
+        const endpoint = isRegister ? '/api/auth/register' : '/api/auth/login';
+        const body = {
+          email: document.getElementById('email').value.trim(),
+          password: document.getElementById('password').value
+        };
+        if (isRegister) {
+          body.full_name = document.getElementById('fullName').value.trim();
+          body.company = document.getElementById('company').value.trim();
+        }
+
+        const resp = await fetch(API + endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Authentication failed');
+
+        localStorage.setItem('onsite_token', data.token);
+        localStorage.setItem('onsite_user', JSON.stringify(data.user));
+        show('alertSuccess', isRegister ? 'Account created! Redirecting...' : 'Welcome back! Redirecting...');
+
+        // Check for pending plan checkout
+        const plan = urlParams.get('plan');
+        if (plan) {
+          try {
+            const cr = await fetch(API + '/api/billing/checkout', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + data.token },
+              body: JSON.stringify({ plan, success_url: window.location.origin + '/app?payment=success', cancel_url: window.location.origin + '/app' })
+            });
+            const cd = await cr.json();
+            if (cd.checkout_url) { window.location.href = cd.checkout_url; return; }
+          } catch(e) {}
+        }
+        setTimeout(() => { window.location.href = '/app'; }, 600);
+
+      } catch (err) {
+        show('alertError', err.message);
+        btn.disabled = false;
+        btn.textContent = isRegister ? 'Create Account' : 'Sign In';
+      }
+    });
+
+    // ── Forgot Password ──
+    document.getElementById('forgotForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      hide('alertError'); hide('alertSuccess');
+      const btn = document.getElementById('forgotBtn');
+      btn.disabled = true;
+      btn.textContent = 'Sending...';
+
+      try {
+        const resp = await fetch(API + '/api/auth/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: document.getElementById('forgotEmail').value.trim() })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Request failed');
+
+        // In development, the token is returned directly
+        if (data.reset_token) {
+          pendingResetToken = data.reset_token;
+          show('alertSuccess', 'Reset link ready. Setting new password...');
+          setTimeout(() => showResetForm(), 800);
+        } else {
+          show('alertSuccess', data.message || 'If that email is registered, a reset link has been sent.');
+        }
+      } catch (err) {
+        show('alertError', err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Send Reset Link';
+      }
+    });
+
+    // ── Reset Password ──
+    document.getElementById('resetForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      hide('alertError'); hide('alertSuccess');
+
+      const newPw = document.getElementById('newPassword').value;
+      const confirmPw = document.getElementById('confirmPassword').value;
+
+      if (newPw !== confirmPw) {
+        show('alertError', 'Passwords do not match');
+        return;
+      }
+
+      const btn = document.getElementById('resetBtn');
+      btn.disabled = true;
+      btn.textContent = 'Resetting...';
+
+      try {
+        const resp = await fetch(API + '/api/auth/reset-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: pendingResetToken, new_password: newPw })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Reset failed');
+
+        show('alertSuccess', 'Password reset! Redirecting to sign in...');
+        pendingResetToken = null;
+        setTimeout(() => {
+          setView('login');
+          isRegister = false;
+          document.getElementById('cardTitle').textContent = 'Sign In';
+          document.getElementById('cardSub').textContent = 'Access your lead dashboard';
+          document.getElementById('submitBtn').textContent = 'Sign In';
+          document.getElementById('toggleLink').innerHTML = "Don't have an account? <b>Register</b>";
+          document.getElementById('authForm').classList.remove('hidden');
+          hide('alertSuccess');
+        }, 1500);
+      } catch (err) {
+        show('alertError', err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Reset Password';
+      }
+    });
+  </script>
+</body>
+</html>

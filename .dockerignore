@@ -1,0 +1,51 @@
+# Version control
+.git
+.gitignore
+
+# Claude / IDE
+.claude/
+.vscode/
+*.code-workspace
+
+# Node
+node_modules/
+package-lock.json
+package.json
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Environment
+.env
+.env.*
+
+# Data files (not needed in image)
+*.db
+*.sqlite
+*.sqlite3
+data_cache.json
+propertyreach_usage.json
+
+# Docs / research (not app code)
+Onsite data/
+Permit Pulse data/
+Permit Pulse docs/
+Dataset free Permit & Parcel Data/
+GC App/
+UI/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tile cache
+backend/.tile_cache/
+
+# Temp files
+*.log
+*.tmp
+tmp_*
+la_response.txt
