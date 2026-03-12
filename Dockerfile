@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r backend/requirements.txt
 # Copy entire application
 COPY main.py ./
 COPY backend/ ./backend/
+COPY backend/static ./static
 
 # Railway sets PORT env var — app reads it at runtime
 ENV PORT=8080
