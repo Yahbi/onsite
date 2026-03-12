@@ -12,11 +12,14 @@ node_modules/
 package-lock.json
 package.json
 
-# Python caches
+# Python caches & venvs
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.venv/
+backend/.venv/
+venv/
 
 # Environment
 .env
