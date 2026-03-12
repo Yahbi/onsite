@@ -36,3 +36,5 @@ python-dotenv>=1.0.0
 
 # Stripe billing (optional)
 stripe>=7.0.0
+
+itsdangerous>=2.0.0
