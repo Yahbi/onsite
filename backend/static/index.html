@@ -660,7 +660,7 @@ function _projFast(mx, my, worldSc, offX, offY) {
   };
 }
 
-function TMap({
+const TMap = React.memo(function TMap({
   leads,
   sel,
   onSel,
@@ -1194,7 +1194,7 @@ function TMap({
     className: "nd",
     style: { position: 'absolute', bottom: 4, left: 8, fontSize: 7, color: 'rgba(0,0,0,.3)', pointerEvents: 'none' }
   }, isSat ? 'Satellite' : 'Map', " \xB7 Onsite by Sapiens Holding Inc."));
-}
+});
 function Landing({
   onEnter,
   onDemo
