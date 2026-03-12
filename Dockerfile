@@ -21,13 +21,9 @@ COPY backend/static ./static
 # Ensure runtime data directories exist
 RUN mkdir -p backend/data backend/static
 
-# Railway sets PORT env var — app reads it at runtime
+# Default — Railway overrides PORT at runtime
 ENV PORT=8080
 
-EXPOSE 8080
+# No HEALTHCHECK in Dockerfile — Railway handles it via railway.toml
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=30s \
-    CMD curl -f http://localhost:${PORT}/api/health || exit 1
-
-# Single worker on Railway to save memory — uvloop + httptools for speed
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 1 --loop uvloop --http httptools"]
+CMD ["python3", "main.py"]
