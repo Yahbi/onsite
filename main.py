@@ -102,7 +102,12 @@ for _mod_path, _attr, _desc in _optional_routers:
 # CORS - allow frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000", "http://localhost:18000", "http://127.0.0.1:18000"],
+    allow_origins=[
+        "http://localhost:8000", "http://127.0.0.1:8000",
+        "http://localhost:18000", "http://127.0.0.1:18000",
+        *([os.getenv("APP_ORIGIN")] if os.getenv("APP_ORIGIN") else []),
+        *[o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()],
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2558,4 +2563,5 @@ async def get_parcel(lat: float, lng: float):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=18000)
+    port = int(os.getenv("PORT", 18000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
