@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from backend.models.database import get_db
+from models.database import get_db
 
 logger = logging.getLogger(__name__)
 

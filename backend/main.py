@@ -4,7 +4,7 @@ Real API integrations, data syncing, geocoding
 Modular architecture with SQLite, WebSocket, and auto-enrichment
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, ORJSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from dataclasses import asdict
+from core.scoring import calculate_score as _score_from_core, classify_temperature, TEMP_THRESHOLDS
 import math
 import csv
 import re
@@ -77,6 +78,21 @@ def ensure_market_tables_seed():
     """Placeholder to seed territory rows if desired."""
     return
 
+
+def _leads_conn():
+    """Connection to leads.db for pipeline stages (consolidated from market.db).
+    All lead_stages operations should use this instead of _conn()."""
+    from models.database import _db_path
+    import sqlite3
+    conn = sqlite3.connect(_db_path(), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS lead_stages (
+        lead_id TEXT PRIMARY KEY,
+        stage TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""")
+    return conn
+
 # ============================================================================
 # ACCESS GATE MIDDLEWARE (non-blocking)
 # ============================================================================
@@ -115,8 +131,8 @@ def log_access(user_id: Optional[str], endpoint: str, req: Request):
         )
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Failed to log access audit for %s: %s", endpoint, e)
 
 
 def load_entitlements(user_id: Optional[str]) -> Dict:
@@ -358,6 +374,13 @@ try:
 except ImportError as e:
     logger.warning(f"Discovered sources router not available: {e}")
 
+try:
+    from routes.source_admin import router as source_admin_router
+    app.include_router(source_admin_router)
+    logger.info("✅ Source admin router registered (registry management)")
+except ImportError as e:
+    logger.warning(f"Source admin router not available: {e}")
+
 
 # ============================================================================
 # CONFIGURATION
@@ -389,7 +412,7 @@ ATTOM_RATE_LIMIT = int(os.getenv("ATTOM_RATE_LIMIT", "100"))  # requests per hou
 BASE_DIR = Path(__file__).resolve().parent
 CACHE_FILE = str(BASE_DIR / "data_cache.json")
 CACHE_DURATION = timedelta(hours=6)  # Refresh every 6 hours (cache freshness check)
-LEADS_RETURN_LIMIT = int(os.getenv("LEADS_RETURN_LIMIT", "50000"))  # Cap at 50K for browser performance
+LEADS_RETURN_LIMIT = int(os.getenv("LEADS_RETURN_LIMIT", "300000"))  # Cap at 300K — full dataset for browser
 MAX_DAYS_OLD = int(os.getenv("MAX_DAYS_OLD", "30"))  # Leads older than 30 days are auto-excluded
 GEOCODE_BUDGET = int(os.getenv("GEOCODE_BUDGET", "0"))  # Disabled: geocoding blocks sync; most leads already have coords
 YELP_INTENT_ENABLED = os.getenv("YELP_INTENT_ENABLED", "0") == "1"
@@ -521,7 +544,7 @@ SOC_DATASETS: Dict[str, Dict[str, Optional[str]]] = {
     "dallas":         {"label": "Dallas Building",       "city": "Dallas",         "domain": "www.dallasopendata.com",  "resource_id": "e7gq-4sah", "date_field": "issued_date",     "lookback_days": 60},
 
     # ── Cambridge, MA (data.cambridgema.gov) ✅ VERIFIED & TESTED ──
-    "cambridge":      {"label": "Cambridge Building",    "city": "Cambridge",      "domain": "data.cambridgema.gov",    "resource_id": "9qm7-wbdc", "date_field": "issue_date",      "lookback_days": 60},
+    "cambridge_v2":   {"label": "Cambridge Building",    "city": "Cambridge",      "domain": "data.cambridgema.gov",    "resource_id": "9qm7-wbdc", "date_field": "issue_date",      "lookback_days": 60},
 
     # ── Roseville, CA (data.roseville.ca.us) ✅ VERIFIED & TESTED ──
     "roseville":      {"label": "Roseville Building",    "city": "Roseville",      "domain": "data.roseville.ca.us",    "resource_id": "buxi-gsvq", "date_field": "issued_date",     "lookback_days": 60},
@@ -1171,7 +1194,8 @@ async def _attom_enrich(lead: dict) -> dict:
 
                 _attom_calls.append(now)
                 return lead
-    except Exception:
+    except Exception as e:
+        logger.warning("ATTOM owner enrichment failed: %s", e)
         return lead
 
 
@@ -1213,8 +1237,8 @@ async def enrich_contacts_batch(leads: list[dict], max_lookups: int):
                         lead["apn"] = result["apn"]
                     enriched_count += 1
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("ArcGIS parcel enrichment failed for (%s, %s): %s", lat, lng, e)
 
             # Fallback: Regrid MVT tiles
             try:
@@ -1226,8 +1250,8 @@ async def enrich_contacts_batch(leads: list[dict], max_lookups: int):
                     if result.get("apn") and not lead.get("apn"):
                         lead["apn"] = result["apn"]
                     enriched_count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Regrid tile enrichment failed for (%s, %s): %s", lat, lng, e)
 
     # Process in batches of 50 to avoid overwhelming services
     batch_size = 50
@@ -1244,91 +1268,28 @@ async def enrich_contacts_batch(leads: list[dict], max_lookups: int):
 # DATA PROCESSING
 # ============================================================================
 
-def calculate_score(days_old: int, valuation: float, permit_type: str) -> tuple:
-    """
-    Lead scoring algorithm - March 2026 v3
-    Wider spread: base 15, recency 0-35, valuation 0-30, work type 0-25.
-    Target: ~5% Hot, ~20% Warm, ~45% Med, ~30% Cold
-    """
-    score = 15
+# calculate_score is now imported from core.scoring (single source of truth)
+calculate_score = _score_from_core
 
-    # 1. RECENCY (0-35 pts) — fresh permits are much more actionable
-    if days_old <= 3:
-        score += 35
-    elif days_old <= 7:
-        score += 30
-    elif days_old <= 14:
-        score += 24
-    elif days_old <= 21:
-        score += 18
-    elif days_old <= 30:
-        score += 12
-    elif days_old <= 60:
-        score += 6
-    elif days_old <= 90:
-        score += 3
-    # 90+ days: +0
 
-    # 2. VALUATION (0-30 pts) — high-value projects are hotter leads
-    if valuation >= 500000:
-        score += 30
-    elif valuation >= 250000:
-        score += 24
-    elif valuation >= 100000:
-        score += 18
-    elif valuation >= 50000:
-        score += 13
-    elif valuation >= 25000:
-        score += 8
-    elif valuation > 0:
-        score += 4
-    # No valuation: +0
+def safe_float(val, default: float = 0.0) -> float:
+    """Safely convert any value to float, returning default on failure."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
 
-    # 3. WORK TYPE (0-25 pts)
-    permit_lower = permit_type.lower()
 
-    if any(kw in permit_lower for kw in ['new construction', 'new building', 'bldg-new']):
-        score += 25
-    elif any(kw in permit_lower for kw in ['addition', 'bldg-addition']):
-        score += 20
-    elif any(kw in permit_lower for kw in ['remodel', 'renovation', 'alter', 'repair']):
-        score += 15
-    elif any(kw in permit_lower for kw in ['pool', 'solar', 'hvac', 'roof']):
-        score += 10
-    elif any(kw in permit_lower for kw in ['plum', 'elec', 'mechanical']):
-        score += 6
-    elif any(kw in permit_lower for kw in ['demo', 'fence', 'sign', 'temp']):
-        score += 2
-    # Generic/unknown: +0
-
-    # Commercial premium
-    if 'commercial' in permit_lower:
-        score += 5
-
-    # Ensure score is within bounds
-    score = max(0, min(100, score))
-
-    # 4. TEMPERATURE — 4-tier system
-    if score >= 80:
-        temp = 'Hot'
-    elif score >= 60:
-        temp = 'Warm'
-    elif score >= 40:
-        temp = 'Medium'
-    else:
-        temp = 'Cold'
-
-    # 5. URGENCY (based on recency AND score)
-    if days_old <= 3 and score >= 80:
-        urgency = 'CRITICAL'
-    elif days_old <= 7 and score >= 70:
-        urgency = 'HIGH'
-    elif days_old <= 14 or score >= 65:
-        urgency = 'MEDIUM'
-    else:
-        urgency = 'LOW'
-
-    return score, temp, urgency
+def safe_int(val, default: int = 0) -> int:
+    """Safely convert any value to int, returning default on failure."""
+    if val is None:
+        return default
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return default
 
 # Access filter helper
 def apply_access_filter(leads: List[dict], request) -> List[dict]:
@@ -1465,22 +1426,28 @@ def normalize_lead_for_ui(lead: dict, slim: bool = False) -> dict:
     """
     from datetime import datetime
 
-    # Calculate days_old
+    # Calculate days_old live (not stale from cache build time)
     days_old = 0
     issue_date = lead.get("issue_date") or lead.get("filed_date") or lead.get("date")
     if issue_date:
         try:
             issued = datetime.fromisoformat(str(issue_date).replace('Z', '+00:00'))
-            days_old = (datetime.now() - issued).days
-        except:
+            days_old = max(0, (datetime.now() - issued).days)
+        except (ValueError, TypeError):
             pass
 
-    # Calculate temperature from score — 4-tier system
+    # Rescore if days_old has drifted from cached value (keeps scores fresh daily)
+    cached_days = lead.get("days_old", 0)
     try:
         score = float(lead.get('score', 0) or 0)
     except (ValueError, TypeError):
         score = 0.0
-    temperature = 'hot' if score >= 80 else 'warm' if score >= 60 else 'med' if score >= 40 else 'cold'
+    if days_old != cached_days and issue_date:
+        valuation = safe_float(lead.get("valuation"))
+        permit_type = str(lead.get("permit_type") or "")
+        score, _, _ = calculate_score(days_old, valuation, permit_type)
+
+    temperature = classify_temperature(int(score))
 
     # Detect sold property from description keywords or absentee owner
     is_sold = lead.get('is_sold', False)
@@ -1503,6 +1470,7 @@ def normalize_lead_for_ui(lead: dict, slim: bool = False) -> dict:
         **lead,
         'id': str(lead.get('id', '')),
         'days_old': days_old,
+        'score': int(score),
         'temperature': temperature,
         'description_full': lead.get('description_full') or lead.get('work_desc') or lead.get('work_description') or lead.get('description') or lead.get('desc') or '',
         'permit_number': lead.get('permit_number') or lead.get('permit_id') or lead.get('id') or '',
@@ -1622,14 +1590,26 @@ def compute_readiness(lead: dict) -> dict:
     return lead
 
 
-def safe_float(val) -> Optional[float]:
-    """Convert value to float if possible."""
+# NOTE: safe_float is defined at line ~1252 with default=0.0 parameter.
+# Duplicate removed — use safe_float(val) for 0.0 default, or safe_float(val, None) for Optional.
+
+
+def _live_days_old(lead: dict) -> int:
+    """Compute days_old from issue_date at request time (never stale)."""
+    from datetime import datetime as _dt
+    issue_date = lead.get("issue_date") or lead.get("filed_date") or lead.get("date")
+    if not issue_date:
+        return 0
     try:
-        if val is None or val == "":
-            return None
-        return float(val)
-    except Exception:
-        return None
+        issued = _dt.fromisoformat(str(issue_date).replace('Z', '+00:00'))
+        return max(0, (_dt.now() - issued).days)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _with_live_days_old(lead: dict) -> dict:
+    """Return a new dict with days_old recomputed from issue_date (immutable)."""
+    return {**lead, "days_old": _live_days_old(lead)}
 
 
 def parse_date(value: Optional[str]) -> Optional[datetime]:
@@ -1772,7 +1752,7 @@ def extract_address(record: dict) -> str:
                     parsed = json.loads(human) if isinstance(human, str) else human
                     if parsed.get("address"):
                         return parsed["address"].strip()
-                except Exception:
+                except (ValueError, TypeError, json.JSONDecodeError):
                     pass
         elif isinstance(loc, str):
             # Sometimes human_address comes as JSON string directly
@@ -1902,7 +1882,7 @@ async def process_ladbs_permit(permit_data: dict, geocoder: GeocodingClient) -> 
         val_str = permit_data.get('valuation', '0')
         try:
             valuation = float(str(val_str).replace('$', '').replace(',', ''))
-        except:
+        except (ValueError, TypeError):
             valuation = 0
         
         # Calculate score
@@ -2641,7 +2621,7 @@ async def batch_enrich_ownership(leads: List[dict], max_enrichments: int = 100) 
     enriched_count = 0
     # Sort by valuation desc so we enrich highest-value leads first
     candidates = [l for l in leads if not l.get("owner_name")]
-    candidates.sort(key=lambda l: safe_float(l.get("valuation") or 0), reverse=True)
+    candidates.sort(key=lambda l: safe_float(l.get("valuation")), reverse=True)
 
     for lead in candidates[:max_enrichments]:
         try:
@@ -2661,8 +2641,9 @@ async def batch_enrich_ownership(leads: List[dict], max_enrichments: int = 100) 
 # FEMA DISASTER RISK ENRICHMENT
 # ============================================================================
 
-# In-memory cache for disaster risk data by state
-_disaster_cache: Dict[str, List[dict]] = {}
+# In-memory cache for disaster risk data by state, with TTL
+_disaster_cache: Dict[str, tuple] = {}  # state -> (timestamp, data)
+_DISASTER_CACHE_TTL = 3600 * 6  # 6 hours
 
 async def get_disaster_risk_for_lead(lead: dict) -> dict:
     """Get disaster risk context for a lead based on state/zip.
@@ -2673,12 +2654,16 @@ async def get_disaster_risk_for_lead(lead: dict) -> dict:
     if not state:
         return {}
 
-    # Cache disaster declarations per state
-    if state not in _disaster_cache:
+    # Cache disaster declarations per state with TTL
+    import time as _time
+    cached_entry = _disaster_cache.get(state)
+    if cached_entry is None or (_time.time() - cached_entry[0]) > _DISASTER_CACHE_TTL:
         disasters = await fetch_fema_disasters(state=state, limit=50)
-        _disaster_cache[state] = disasters
+        _disaster_cache[state] = (_time.time(), disasters)
+    else:
+        disasters = cached_entry[1]
 
-    recent_disasters = _disaster_cache.get(state, [])
+    recent_disasters = disasters
 
     # Build risk profile
     risk_profile = {
@@ -2758,185 +2743,256 @@ async def sync_data():
 
         geocode_budget = GEOCODE_BUDGET
 
-        # Fetch from verified Socrata datasets
-        for key, cfg in SOC_DATASETS.items():
+        # ── Registry-driven sync (new: reads from SQLite api_sources) ──
+        if os.getenv("USE_REGISTRY_SYNC", "0") == "1":
             try:
-                days = cfg.get("lookback_days", 90)
-                records = await fetch_socrata_best(
-                    cfg["domain"],
-                    cfg["resource_id"],
-                    cfg.get("date_field"),
-                    cfg.get("filters"),
-                    days=days,
-                )
-                logger.info(f"{cfg['label']}: fetched {len(records)} rows")
-                accepted = 0
-                skip_latlng = skip_addr = skip_date = 0
-                for r in records:
-                    lat, lng = extract_lat_lng(r)
-                    lat, lng = fix_coordinates(lat, lng) if lat and lng else (lat, lng)
-                    if lat is None or lng is None:
-                        if geocode_budget > 0:
-                            addr_for_geo = extract_address(r)
-                            city_for_geo = cfg.get("city") or r.get("city") or ""
-                            if addr_for_geo and city_for_geo:
-                                coords = await geocoder.geocode(addr_for_geo, city_for_geo)
-                                if coords:
-                                    lat, lng = coords["lat"], coords["lng"]
-                                    geocode_budget -= 1
-                        if lat is None or lng is None:
-                            skip_latlng += 1
-                            continue
-
-                    address = extract_address(r)
-                    if not address:
-                        skip_addr += 1
-                        continue
-                    permit_number = extract_permit_number(r)
-                    permit_type = (r.get("permit_type") or r.get("record_type") or r.get("permit_type_definition")
-                        or r.get("permittypemapped") or r.get("record_category") or r.get("work_type")
-                        or r.get("permittypedesc") or "")
-                    issue_field = cfg.get("date_field")
-                    issue_raw = r.get(issue_field) if issue_field else None
-                    # Broad fallback: try many common date field names
-                    if not issue_raw:
-                        for df in ("issue_date", "issued_date", "filed_date", "permit_date",
-                                   "issuance_date", "issueddate", "date_issued", "filing_date",
-                                   "application_date", "applieddate", "statusdate", "completed_date",
-                                   "permitissuedate", "latest_action_date", "approved_date",
-                                   "expiration_date", "inspection_date", "permit_creation_date",
-                                   "submitted_date", "created_date", "status_date"):
-                            issue_raw = r.get(df)
-                            if issue_raw:
-                                break
-                    issue_dt = parse_date(issue_raw)
-                    issue_date = issue_dt.strftime("%Y-%m-%d") if issue_dt else ""
-                    # If the API already filtered by date, trust the results are recent
-                    days_old = (datetime.utcnow() - issue_dt).days if issue_dt else 15
-                    if days_old > MAX_DAYS_OLD:
-                        skip_date += 1
-                        continue
-                    valuation = safe_float(
-                        r.get("valuation") or r.get("estimated_cost") or r.get("permit_valuation")
-                        or r.get("job_value") or r.get("initial_cost") or r.get("construction_cost")
-                        or r.get("estimated_value") or r.get("project_value") or r.get("cost")
-                        or r.get("total_job_valuation") or r.get("total_construction_value")
-                        or r.get("reported_cost") or r.get("estprojectcostdec")
-                        or r.get("estimated_job_costs") or r.get("fee") or r.get("total_fee")
-                    )
-                    valuation = valuation if valuation is not None else 0.0
-
-                    # Owner / applicant identity
-                    owner_name = (
-                        r.get("owner_name") or
-                        r.get("owner") or
-                        " ".join(filter(None, [r.get("owner_first_name"), r.get("owner_last_name")])) or
-                        " ".join(filter(None, [r.get("applicant_first_name"), r.get("applicant_last_name")])) or
-                        r.get("applicant_name") or
-                        r.get("applicant") or
-                        r.get("contact_name") or
-                        r.get("contact_1_name") or
-                        r.get("owner_s_first_name", "") + " " + r.get("owner_s_last_name", "") or
-                        ""
-                    ).strip()
-
-                    owner_phone = (
-                        r.get("owner_phone") or r.get("phone") or r.get("contact_phone") or
-                        r.get("phone1") or r.get("phone_number") or r.get("applicant_phone")
-                        or r.get("owner_s_phone__") or ""
-                    )
-                    owner_email = r.get("owner_email") or r.get("email") or r.get("applicant_email") or ""
-
-                    contractor = (r.get("contractor_name") or r.get("contractor") or r.get("contractor_business_name")
-                        or r.get("contractorcompanyname") or r.get("companyname")
-                        or r.get("applicant_business_name") or r.get("permittee_s_business_name") or "")
-                    contractor_phone = r.get("contractor_phone") or ""
-
-                    score, temp, urgency = calculate_score(days_old, valuation, permit_type or "")
-
-                    desc_candidates = [
-                        r.get("work_desc"),
-                        r.get("description"),
-                        r.get("work_description"),
-                        r.get("scope_description"),
-                        r.get("comments"),
-                        r.get("permit_type_definition"),
-                        r.get("use_desc"),
-                        r.get("permit_sub_type"),
-                        r.get("record_type"),
-                        permit_type,
-                    ]
-                    professional_desc = next((d for d in desc_candidates if d), "") or ""
-                    # Preserve the fullest description we can assemble from the record
-                    description_full = " | ".join([d for d in desc_candidates if d])
-
-                    # Use the original permit description verbatim; keep optional extra info separately
-                    base_desc = professional_desc or "Permit filed"
-                    value_txt = f"${valuation:,.0f}" if valuation else "n/a"
-                    issue_txt = issue_date or "n/a"
-                    contractor_txt = contractor or r.get("applicant_name") or r.get("contact_name") or ""
-                    suffix_parts = [
-                        f"Type: {permit_type or 'n/a'}",
-                        f"Value: {value_txt}",
-                        f"Filed: {issue_txt}",
-                    ]
-                    if contractor_txt:
-                        suffix_parts.append(f"Contractor/Applicant: {contractor_txt}")
-                    extra_info = " | ".join([p for p in suffix_parts if p])
-
-                    lead = {
-                        "id": abs(hash(f"{key}:{permit_number}:{address}")),
-                        "permit_number": permit_number,
-                        "address": address,
-                        "city": cfg.get("city") or r.get("city") or "",
-                        "zip": r.get("zip") or r.get("zip_code") or r.get("zipcode") or r.get("originalzip") or "",
-                        "lat": lat,
-                        "lng": lng,
-                        "work_description": base_desc,
-                        "description_full": description_full,
-                        "details": extra_info,
-                        "permit_type": permit_type,
-                        "valuation": valuation,
-                        "issue_date": issue_date,
-                        "days_old": days_old,
-                        "score": score,
-                        "temperature": temp.capitalize(),
-                        "urgency": urgency,
-                        "source": cfg["label"],
-                        "apn": r.get("apn") or r.get("parcel_number") or "",
-                        "owner_name": owner_name,
-                        "owner_phone": owner_phone,
-                        "owner_email": owner_email,
-                        "contractor_name": contractor,
-                        "contractor_phone": contractor_phone,
-                        "state": _infer_state(cfg.get("city") or r.get("city") or ""),
-                        "permit_url": _build_permit_url(cfg.get("city") or "", permit_number, cfg.get("domain") or "", cfg.get("resource_id") or ""),
-                    }
-
-                    # Override permit_url with direct link if Socrata record has one
-                    raw_link = r.get("link")
-                    if raw_link:
-                        if isinstance(raw_link, dict) and raw_link.get("url"):
-                            lead["permit_url"] = raw_link["url"]
-                        elif isinstance(raw_link, str) and raw_link.startswith("http"):
-                            lead["permit_url"] = raw_link
-
-                    # Tier 1: Optional inline LA Assessor lookup (disabled by default; blocks event loop)
-                    if LA_ASSESSOR_INLINE and not owner_name and lead.get("apn") and "los angeles" in lead.get("city", "").lower():
-                        try:
-                            owner_data = get_la_owner(lead["apn"])
-                            if owner_data and owner_data.get("owner_name"):
-                                lead["owner_name"] = owner_data.get("owner_name", "")
-                                lead["mailing_address"] = owner_data.get("mailing_address", "")
-                                logger.info(f"✅ LA Assessor: {lead['owner_name']}")
-                        except Exception as e:
-                            logger.warning(f"LA Assessor lookup failed for APN {lead.get('apn')}: {e}")
-                
-                    all_leads.append(lead)
-                    accepted += 1
-                logger.info(f"{cfg['label']}: accepted {accepted} leads with lat/lng (skipped: {skip_latlng} no-latlng, {skip_addr} no-addr, {skip_date} too-old)")
+                from services.source_registry import get_sources_for_sync, mark_synced
+                from services.fetchers import fetch_from_source
+                max_sources = int(os.getenv("SYNC_MAX_SOURCES", "50"))
+                registry_sources = get_sources_for_sync(category="permit", limit=max_sources)
+                logger.info("Registry sync: %d sources to fetch", len(registry_sources))
+                for src in registry_sources:
+                    try:
+                        records = await fetch_from_source(src, timeout_seconds=30)
+                        if records:
+                            logger.info("Registry %s: %d records", src.get("api_name", ""), len(records))
+                            for r in records:
+                                lat, lng = extract_lat_lng(r)
+                                lat, lng = fix_coordinates(lat, lng) if lat and lng else (lat, lng)
+                                if lat is None or lng is None:
+                                    continue
+                                address = extract_address(r)
+                                if not address:
+                                    continue
+                                permit_number = extract_permit_number(r)
+                                permit_type = (
+                                    r.get("permit_type") or r.get("record_type")
+                                    or r.get("permit_type_definition") or r.get("work_type") or ""
+                                )
+                                issue_raw = r.get("issue_date") or r.get("issued_date") or r.get("filed_date") or ""
+                                issue_dt = parse_date(issue_raw)
+                                issue_date = issue_dt.strftime("%Y-%m-%d") if issue_dt else ""
+                                days_old = (datetime.utcnow() - issue_dt).days if issue_dt else 15
+                                valuation = safe_float(
+                                    r.get("valuation") or r.get("estimated_cost") or r.get("job_value") or 0
+                                )
+                                score, temp, urgency = calculate_score(days_old, valuation, permit_type)
+                                lead = {
+                                    "id": abs(hash(f"reg:{src.get('id', '')}:{permit_number}:{address}")),
+                                    "permit_number": permit_number,
+                                    "address": address,
+                                    "city": src.get("location", "") or r.get("city", ""),
+                                    "zip": r.get("zip") or r.get("zip_code") or "",
+                                    "lat": lat,
+                                    "lng": lng,
+                                    "work_description": permit_type or "Permit filed",
+                                    "permit_type": permit_type,
+                                    "valuation": valuation,
+                                    "issue_date": issue_date,
+                                    "days_old": days_old,
+                                    "score": score,
+                                    "temperature": temp,
+                                    "urgency": urgency,
+                                    "source": src.get("api_name", "registry"),
+                                    "owner_name": r.get("owner_name") or r.get("applicant_name") or "",
+                                    "owner_phone": r.get("owner_phone") or r.get("phone") or "",
+                                    "owner_email": r.get("owner_email") or r.get("email") or "",
+                                    "state": src.get("state", "") or _infer_state(src.get("location", "")),
+                                }
+                                all_leads.append(lead)
+                            mark_synced(src["id"], len(records))
+                        else:
+                            mark_synced(src["id"], 0, "No records returned")
+                    except Exception as e:
+                        logger.warning("Registry source %s error: %s", src.get("api_name", ""), e)
+                        mark_synced(src["id"], 0, str(e)[:200])
+                logger.info("Registry sync complete: %d total leads", len(all_leads))
             except Exception as e:
-                logger.error(f"Socrata fetch {cfg['label']} failed: {e}")
+                logger.error("Registry sync failed, falling back to config: %s", e)
+        else:
+            # Original config-driven sync (fallback)
+            pass
+
+        # Fetch from verified Socrata datasets
+        if os.getenv("USE_REGISTRY_SYNC", "0") != "1":
+            for key, cfg in SOC_DATASETS.items():
+                try:
+                    days = cfg.get("lookback_days", 90)
+                    records = await fetch_socrata_best(
+                        cfg["domain"],
+                        cfg["resource_id"],
+                        cfg.get("date_field"),
+                        cfg.get("filters"),
+                        days=days,
+                    )
+                    logger.info(f"{cfg['label']}: fetched {len(records)} rows")
+                    accepted = 0
+                    skip_latlng = skip_addr = skip_date = 0
+                    for r in records:
+                        lat, lng = extract_lat_lng(r)
+                        lat, lng = fix_coordinates(lat, lng) if lat and lng else (lat, lng)
+                        if lat is None or lng is None:
+                            if geocode_budget > 0:
+                                addr_for_geo = extract_address(r)
+                                city_for_geo = cfg.get("city") or r.get("city") or ""
+                                if addr_for_geo and city_for_geo:
+                                    coords = await geocoder.geocode(addr_for_geo, city_for_geo)
+                                    if coords:
+                                        lat, lng = coords["lat"], coords["lng"]
+                                        geocode_budget -= 1
+                            if lat is None or lng is None:
+                                skip_latlng += 1
+                                continue
+
+                        address = extract_address(r)
+                        if not address:
+                            skip_addr += 1
+                            continue
+                        permit_number = extract_permit_number(r)
+                        permit_type = (r.get("permit_type") or r.get("record_type") or r.get("permit_type_definition")
+                            or r.get("permittypemapped") or r.get("record_category") or r.get("work_type")
+                            or r.get("permittypedesc") or "")
+                        issue_field = cfg.get("date_field")
+                        issue_raw = r.get(issue_field) if issue_field else None
+                        # Broad fallback: try many common date field names
+                        if not issue_raw:
+                            for df in ("issue_date", "issued_date", "filed_date", "permit_date",
+                                       "issuance_date", "issueddate", "date_issued", "filing_date",
+                                       "application_date", "applieddate", "statusdate", "completed_date",
+                                       "permitissuedate", "latest_action_date", "approved_date",
+                                       "expiration_date", "inspection_date", "permit_creation_date",
+                                       "submitted_date", "created_date", "status_date"):
+                                issue_raw = r.get(df)
+                                if issue_raw:
+                                    break
+                        issue_dt = parse_date(issue_raw)
+                        issue_date = issue_dt.strftime("%Y-%m-%d") if issue_dt else ""
+                        # If the API already filtered by date, trust the results are recent
+                        days_old = (datetime.utcnow() - issue_dt).days if issue_dt else 15
+                        if days_old > MAX_DAYS_OLD:
+                            skip_date += 1
+                            continue
+                        valuation = safe_float(
+                            r.get("valuation") or r.get("estimated_cost") or r.get("permit_valuation")
+                            or r.get("job_value") or r.get("initial_cost") or r.get("construction_cost")
+                            or r.get("estimated_value") or r.get("project_value") or r.get("cost")
+                            or r.get("total_job_valuation") or r.get("total_construction_value")
+                            or r.get("reported_cost") or r.get("estprojectcostdec")
+                            or r.get("estimated_job_costs") or r.get("fee") or r.get("total_fee")
+                        )
+                        valuation = valuation if valuation is not None else 0.0
+
+                        # Owner / applicant identity
+                        owner_name = (
+                            r.get("owner_name") or
+                            r.get("owner") or
+                            " ".join(filter(None, [r.get("owner_first_name"), r.get("owner_last_name")])) or
+                            " ".join(filter(None, [r.get("applicant_first_name"), r.get("applicant_last_name")])) or
+                            r.get("applicant_name") or
+                            r.get("applicant") or
+                            r.get("contact_name") or
+                            r.get("contact_1_name") or
+                            r.get("owner_s_first_name", "") + " " + r.get("owner_s_last_name", "") or
+                            ""
+                        ).strip()
+
+                        owner_phone = (
+                            r.get("owner_phone") or r.get("phone") or r.get("contact_phone") or
+                            r.get("phone1") or r.get("phone_number") or r.get("applicant_phone")
+                            or r.get("owner_s_phone__") or ""
+                        )
+                        owner_email = r.get("owner_email") or r.get("email") or r.get("applicant_email") or ""
+
+                        contractor = (r.get("contractor_name") or r.get("contractor") or r.get("contractor_business_name")
+                            or r.get("contractorcompanyname") or r.get("companyname")
+                            or r.get("applicant_business_name") or r.get("permittee_s_business_name") or "")
+                        contractor_phone = r.get("contractor_phone") or ""
+
+                        score, temp, urgency = calculate_score(days_old, valuation, permit_type or "")
+
+                        desc_candidates = [
+                            r.get("work_desc"),
+                            r.get("description"),
+                            r.get("work_description"),
+                            r.get("scope_description"),
+                            r.get("comments"),
+                            r.get("permit_type_definition"),
+                            r.get("use_desc"),
+                            r.get("permit_sub_type"),
+                            r.get("record_type"),
+                            permit_type,
+                        ]
+                        professional_desc = next((d for d in desc_candidates if d), "") or ""
+                        # Preserve the fullest description we can assemble from the record
+                        description_full = " | ".join([d for d in desc_candidates if d])
+
+                        # Use the original permit description verbatim; keep optional extra info separately
+                        base_desc = professional_desc or "Permit filed"
+                        value_txt = f"${valuation:,.0f}" if valuation else "n/a"
+                        issue_txt = issue_date or "n/a"
+                        contractor_txt = contractor or r.get("applicant_name") or r.get("contact_name") or ""
+                        suffix_parts = [
+                            f"Type: {permit_type or 'n/a'}",
+                            f"Value: {value_txt}",
+                            f"Filed: {issue_txt}",
+                        ]
+                        if contractor_txt:
+                            suffix_parts.append(f"Contractor/Applicant: {contractor_txt}")
+                        extra_info = " | ".join([p for p in suffix_parts if p])
+
+                        lead = {
+                            "id": abs(hash(f"{key}:{permit_number}:{address}")),
+                            "permit_number": permit_number,
+                            "address": address,
+                            "city": cfg.get("city") or r.get("city") or "",
+                            "zip": r.get("zip") or r.get("zip_code") or r.get("zipcode") or r.get("originalzip") or "",
+                            "lat": lat,
+                            "lng": lng,
+                            "work_description": base_desc,
+                            "description_full": description_full,
+                            "details": extra_info,
+                            "permit_type": permit_type,
+                            "valuation": valuation,
+                            "issue_date": issue_date,
+                            "days_old": days_old,
+                            "score": score,
+                            "temperature": temp,
+                            "urgency": urgency,
+                            "source": cfg["label"],
+                            "apn": r.get("apn") or r.get("parcel_number") or "",
+                            "owner_name": owner_name,
+                            "owner_phone": owner_phone,
+                            "owner_email": owner_email,
+                            "contractor_name": contractor,
+                            "contractor_phone": contractor_phone,
+                            "state": _infer_state(cfg.get("city") or r.get("city") or ""),
+                            "permit_url": _build_permit_url(cfg.get("city") or "", permit_number, cfg.get("domain") or "", cfg.get("resource_id") or ""),
+                        }
+
+                        # Override permit_url with direct link if Socrata record has one
+                        raw_link = r.get("link")
+                        if raw_link:
+                            if isinstance(raw_link, dict) and raw_link.get("url"):
+                                lead["permit_url"] = raw_link["url"]
+                            elif isinstance(raw_link, str) and raw_link.startswith("http"):
+                                lead["permit_url"] = raw_link
+
+                        # Tier 1: Optional inline LA Assessor lookup (disabled by default; blocks event loop)
+                        if LA_ASSESSOR_INLINE and not owner_name and lead.get("apn") and "los angeles" in lead.get("city", "").lower():
+                            try:
+                                owner_data = get_la_owner(lead["apn"])
+                                if owner_data and owner_data.get("owner_name"):
+                                    lead["owner_name"] = owner_data.get("owner_name", "")
+                                    lead["mailing_address"] = owner_data.get("mailing_address", "")
+                                    logger.info(f"✅ LA Assessor: {lead['owner_name']}")
+                            except Exception as e:
+                                logger.warning(f"LA Assessor lookup failed for APN {lead.get('apn')}: {e}")
+                
+                        all_leads.append(lead)
+                        accepted += 1
+                    logger.info(f"{cfg['label']}: accepted {accepted} leads with lat/lng (skipped: {skip_latlng} no-latlng, {skip_addr} no-addr, {skip_date} too-old)")
+                except Exception as e:
+                    logger.error(f"Socrata fetch {cfg['label']} failed: {e}")
 
         # Fetch San Jose CSV datasets (no auth; may lack lat/lng)
         for sj in SAN_JOSE_SOURCES:
@@ -3007,7 +3063,7 @@ async def sync_data():
                                 "issue_date": issue_date,
                                 "days_old": days_old,
                                 "score": score,
-                                "temperature": temp.capitalize(),
+                                "temperature": temp,
                                 "urgency": urgency,
                                 "source": sj["label"],
                                 "apn": r.get("assessors_parcel_number") or "",
@@ -3150,7 +3206,7 @@ async def sync_data():
                         "issue_date": issue_date,
                         "days_old": days_old,
                         "score": score,
-                        "temperature": temp.capitalize(),
+                        "temperature": temp,
                         "urgency": urgency,
                         "source": arc_cfg["label"],
                         "apn": r.get("APN") or r.get("ParcelNumber") or r.get("PARCEL_NUM") or r.get("parcel_id") or r.get("FOLIO") or r.get("BLOCKLOT") or r.get("PRCLID") or r.get("GPIN") or "",
@@ -3273,7 +3329,7 @@ async def sync_data():
                         "issue_date": issue_date,
                         "days_old": days_old,
                         "score": score,
-                        "temperature": temp.capitalize(),
+                        "temperature": temp,
                         "urgency": urgency,
                         "source": ckan_cfg["label"],
                         "apn": apn,
@@ -3391,7 +3447,7 @@ async def sync_data():
                         "issue_date": issue_date,
                         "days_old": days_old,
                         "score": score,
-                        "temperature": temp.capitalize(),
+                        "temperature": temp,
                         "urgency": urgency,
                         "source": carto_cfg["label"],
                         "apn": r.get("apn") or "",
@@ -3479,7 +3535,7 @@ async def sync_data():
                         "issue_date": issue_date,
                         "days_old": days_old,
                         "score": score,
-                        "temperature": temp.capitalize(),
+                        "temperature": temp,
                         "urgency": urgency,
                         "source": state_cfg["label"],
                         "apn": r.get("apn") or "",
@@ -3610,7 +3666,7 @@ async def sync_data():
                                 "issue_date": issue_date,
                                 "days_old": days_old,
                                 "score": score,
-                                "temperature": temp.capitalize(),
+                                "temperature": temp,
                                 "urgency": urgency,
                                 "source": dcfg["label"],
                                 "apn": str(r.get("apn") or ""),
@@ -3733,7 +3789,7 @@ async def sync_data():
                                 "issue_date": issue_date,
                                 "days_old": days_old,
                                 "score": score,
-                                "temperature": temp.capitalize(),
+                                "temperature": temp,
                                 "urgency": urgency,
                                 "source": dcfg["label"],
                                 "apn": r.get("APN") or r.get("apn") or r.get("PARCEL") or "",
@@ -3887,7 +3943,7 @@ async def sync_data():
                         try:
                             loss_year = int(year_of_loss) if year_of_loss else datetime.utcnow().year
                             days_old = (datetime.utcnow().year - loss_year) * 365
-                        except:
+                        except (ValueError, TypeError):
                             days_old = 365
 
                         if days_old > MAX_DAYS_OLD:
@@ -3912,7 +3968,7 @@ async def sync_data():
                             "issue_date": f"{year_of_loss}-01-01",
                             "days_old": days_old,
                             "score": score,
-                            "temperature": temp.capitalize(),
+                            "temperature": temp,
                             "urgency": urgency,
                             "source": "FEMA NFIP Claims",
                             "state": state,
@@ -3980,7 +4036,8 @@ async def periodic_yelp_intents():
             async def _owner_lookup(county, apn, address):
                 try:
                     return await asyncio.to_thread(get_la_owner, apn)
-                except Exception:
+                except Exception as e:
+                    logger.warning("LA owner lookup failed for APN %s: %s", apn, e)
                     return {}
 
             async def _contact_lookup(street, city, state, zip_code):
@@ -4023,19 +4080,50 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"SQLite init failed (non-fatal): {e}")
 
+    # ── Auto-populate source registry on first boot ──
+    try:
+        from models.database import get_db
+        with get_db() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM api_sources").fetchone()[0]
+        if count == 0:
+            logger.info("api_sources empty — running initial migration...")
+            from scripts.migrate_config_sources import migrate
+            migrate()
+            logger.info("Config sources migrated to registry")
+    except Exception as e:
+        logger.warning("Source registry init: %s", e)
+
+    # ── Start source validator background task ──
+    try:
+        from services.source_validator import validation_loop
+        asyncio.create_task(validation_loop())
+        logger.info("Source validator started")
+    except Exception as e:
+        logger.warning("Source validator not started: %s", e)
+
+    # ── Periodic federal data collection (weekly) ──
+    if os.getenv("ENABLE_FEDERAL_SYNC", "0") == "1":
+        async def _federal_collection_loop():
+            await asyncio.sleep(3600)  # Wait 1 hour after startup
+            while True:
+                try:
+                    from data_sources.run_collection import step_fema, step_census, step_hpi
+                    import asyncio as _aio
+                    await _aio.to_thread(step_fema)
+                    await _aio.to_thread(step_census)
+                    await _aio.to_thread(step_hpi)
+                    logger.info("Federal data collection complete")
+                except Exception as e:
+                    logger.warning("Federal collection error: %s", e)
+                await asyncio.sleep(604800)  # Weekly
+        asyncio.create_task(_federal_collection_loop())
+        logger.info("Federal data collection scheduled (weekly)")
+
     # ── Background: load JSON cache only if SQLite is empty ──
     async def _background_cache_load():
         """Load and process the large data cache in the background (only if SQLite has no leads)."""
         await asyncio.sleep(1)  # Let server finish startup first
-        # Check if SQLite already has leads — if so, skip the expensive JSON load
-        try:
-            from models.database import query_leads as _db_ql
-            _, db_count = _db_ql(limit=1)
-            if db_count > 100:
-                logger.info(f"✅ SQLite has {db_count:,} leads — skipping 1.5GB JSON cache load")
-                return
-        except Exception:
-            pass
+        # Always rebuild cleaned leads (from JSON cache or SQLite fallback)
         try:
             logger.info("Background cache load starting...")
             loop = asyncio.get_event_loop()
@@ -4043,6 +4131,27 @@ async def startup_event():
             logger.info(f"✅ Background cache loaded: {len(_cleaned_leads):,} leads")
         except Exception as e:
             logger.warning(f"Background cache load failed (non-fatal): {e}")
+
+        # Cache-DB alignment check
+        try:
+            from models.database import get_db
+            with get_db() as db:
+                db_count = db.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+            cache_count = len(_cleaned_leads)
+            if db_count > 0 and cache_count > 0:
+                ratio = min(db_count, cache_count) / max(db_count, cache_count)
+                if ratio < 0.8:
+                    logger.warning(
+                        "⚠️ Cache-DB misalignment: cache=%d, db=%d (%.0f%% ratio). "
+                        "Consider running /api/admin/sync to reconcile.",
+                        cache_count, db_count, ratio * 100,
+                    )
+                else:
+                    logger.info("✅ Cache-DB alignment OK: cache=%d, db=%d", cache_count, db_count)
+            elif db_count == 0 and cache_count > 0:
+                logger.info("DB empty, cache has %d leads (normal on first run)", cache_count)
+        except Exception as e:
+            logger.debug("Cache-DB alignment check skipped: %s", e)
 
         # Pre-warm response cache after leads are loaded
         if _cleaned_leads:
@@ -4082,33 +4191,43 @@ async def startup_event():
         logger.info("Yelp intent ingestion enabled; starting background loop")
         asyncio.create_task(periodic_yelp_intents())
     
-    # ── v3.0: Post-sync auto-enrichment ──
-    # DISABLED 2026-03-01: Auto-enrichment infinite loop was blocking sync completion
-    # The while True loop runs every 5 min and prevents sync from finishing/writing to DB
-    # Re-enable this AFTER fixing the loop to run only once per sync cycle, not continuously
-    # try:
-    #     from core.enrichment_engine import enrichment_pipeline
-    #     from models.database import get_leads_needing_enrichment, mark_enriched
-    #     async def auto_enrich_after_sync():
-    #         """Auto-enrich leads after each sync cycle."""
-    #         await asyncio.sleep(30)  # Wait for first sync
-    #         while True:
-    #             try:
-    #                 leads = get_leads_needing_enrichment(limit=50)
-    #                 if leads:
-    #                     logger.info(f"Auto-enriching {len(leads)} leads...")
-    #                     stats = await enrichment_pipeline.batch_enrich(leads, max_enrichments=50)
-    #                     for lead in leads:
-    #                         if lead.get("enrichment_status") == "enriched":
-    #                             mark_enriched(lead["id"], lead)
-    #                     logger.info(f"Auto-enrichment: {stats.get('enriched', 0)} enriched")
-    #             except Exception as e:
-    #                 logger.warning(f"Auto-enrichment error: {e}")
-    #             await asyncio.sleep(300)  # Every 5 minutes
-    #     asyncio.create_task(auto_enrich_after_sync())
-    #     logger.info("✅ Auto-enrichment pipeline started")
-    # except ImportError:
-    #     logger.info("Auto-enrichment not available (modules not found)")
+    # ── v3.1: Post-sync auto-enrichment (fixed with safeguards) ──
+    try:
+        from services.enrichment_orchestrator import enrich_batch
+        from models.database import get_leads_needing_enrichment, mark_enriched
+
+        async def auto_enrich_after_sync():
+            """Auto-enrich leads after sync — batch of 50, 60s cooldown, circuit breaker."""
+            await asyncio.sleep(60)  # Wait for first sync to complete
+            consecutive_failures = 0
+            max_failures = 3  # Circuit breaker threshold
+            while True:
+                if consecutive_failures >= max_failures:
+                    logger.warning("Auto-enrichment circuit breaker tripped after %d failures, pausing 10min", max_failures)
+                    await asyncio.sleep(600)
+                    consecutive_failures = 0
+                try:
+                    leads = get_leads_needing_enrichment(limit=50)
+                    if not leads:
+                        await asyncio.sleep(300)  # Nothing to enrich, check again in 5min
+                        continue
+                    logger.info("Auto-enriching %d leads...", len(leads))
+                    stats = await enrich_batch(leads, max_leads=50, concurrency=3)
+                    enriched_count = stats.get("enriched", 0)
+                    for lead in leads:
+                        if lead.get("owner_phone") or lead.get("owner_email"):
+                            mark_enriched(lead["id"], lead)
+                    logger.info("Auto-enrichment: %d enriched", enriched_count)
+                    consecutive_failures = 0
+                except Exception as e:
+                    consecutive_failures += 1
+                    logger.warning("Auto-enrichment error (%d/%d): %s", consecutive_failures, max_failures, e)
+                await asyncio.sleep(60)  # 60s cooldown between batches
+
+        asyncio.create_task(auto_enrich_after_sync())
+        logger.info("Auto-enrichment pipeline started (batch=50, cooldown=60s, circuit_breaker=3)")
+    except ImportError as e:
+        logger.info("Auto-enrichment not available: %s", e)
 
 # Mount static files (frontend is a single self-contained index.html)
 _static_dir = Path(__file__).parent / "static"
@@ -4172,7 +4291,35 @@ async def lead_details(lead_id: int):
         "description_full": lead.get("description_full"),
         "source": lead.get("source"),
     }
-    return {"lead_id": lead_id, "summary": summary, "raw": lead}
+
+    # Enrich with ZIP-level risk data
+    zip_risk = None
+    zip_code = (lead.get("zip") or "")[:5]
+    if zip_code and len(zip_code) == 5:
+        try:
+            from data_sources.schema import get_db as get_ds_db
+            with get_ds_db() as conn:
+                row = conn.execute(
+                    "SELECT nfip_flood_claims_count, nfip_flood_total_paid_usd, "
+                    "fema_disaster_count, fema_disaster_types, fema_ia_approved_usd, "
+                    "fhfa_hpi_index, fhfa_hpi_year, census_permits_count "
+                    "FROM zip_risk_data WHERE zip_code = ?", (zip_code,)
+                ).fetchone()
+                if row:
+                    zip_risk = {
+                        "flood_claims": row[0],
+                        "flood_total_paid": row[1],
+                        "disaster_count": row[2],
+                        "disaster_types": row[3],
+                        "ia_approved_usd": row[4],
+                        "hpi_index": row[5],
+                        "hpi_year": row[6],
+                        "census_permits": row[7],
+                    }
+        except Exception as e:
+            logger.error("Failed to query zip_risk_cache for lead %s: %s", lead_id, e)
+
+    return {"lead_id": lead_id, "summary": summary, "zip_risk": zip_risk, "raw": lead}
 
 
 # Property search to find owner info (100% free sources)
@@ -4466,6 +4613,225 @@ _state_names_set = {
     "arkansas", "oregon", "oklahoma", "kentucky", "louisiana",
 }
 
+# ── City Name Normalization ──
+# Maps data-source slugs and mangled city names to (real_city, state)
+_CITY_NAME_FIXES: dict[str, tuple[str, str]] = {
+    # Source slugs → real cities
+    "nola": ("New Orleans", "LA"),
+    "lacity": ("Los Angeles", "CA"),
+    "la building": ("Los Angeles", "CA"),
+    "la electrical": ("Los Angeles", "CA"),
+    "la pipeline": ("Los Angeles", "CA"),
+    "city of los angeles": ("Los Angeles", "CA"),
+    "cityofchigo": ("Chicago", "IL"),
+    "chicago building": ("Chicago", "IL"),
+    "city of chicago": ("Chicago", "IL"),
+    "mbridgema": ("Cambridge", "MA"),
+    "cambridge building": ("Cambridge", "MA"),
+    "framinghamma": ("Framingham", "MA"),
+    "cityofnewyork": ("New York", "NY"),
+    "nyc approved": ("New York", "NY"),
+    "cityofgainesville": ("Gainesville", "FL"),
+    "cityoforlando": ("Orlando", "FL"),
+    "providenceri": ("Providence", "RI"),
+    "city of providence": ("Providence", "RI"),
+    "citymesaaz": ("Mesa", "AZ"),
+    "cos seattle": ("Seattle", "WA"),
+    "seattle building": ("Seattle", "WA"),
+    "city of seattle": ("Seattle", "WA"),
+    "city of san francisco": ("San Francisco", "CA"),
+    "sf building (2013+)": ("San Francisco", "CA"),
+    "bayareametro": ("Oakland", "CA"),
+    "detroit building": ("Detroit", "MI"),
+    "city of detroit": ("Detroit", "MI"),
+    "miami-dade building": ("Miami", "FL"),
+    "tampa building": ("Tampa", "FL"),
+    "baltimore building": ("Baltimore", "MD"),
+    "phoenix building": ("Phoenix", "AZ"),
+    "austin building": ("Austin", "TX"),
+    "austin-metro": ("Austin", "TX"),
+    "atin metro": ("Austin", "TX"),
+    "city of austin": ("Austin", "TX"),
+    "denver residential": ("Denver", "CO"),
+    "cincinnati building": ("Cincinnati", "OH"),
+    "cincinnati oh": ("Cincinnati", "OH"),
+    "dc building (30d)": ("Washington", "DC"),
+    "district of columbia": ("Washington", "DC"),
+    "las vegas building": ("Las Vegas", "NV"),
+    "city of bellevue": ("Bellevue", "WA"),
+    "city of naperville": ("Naperville", "IL"),
+    "city of boulder, colorado": ("Boulder", "CO"),
+    "city of westminster, colorado": ("Westminster", "CO"),
+    "city of worcester, ma": ("Worcester", "MA"),
+    "city of san marcos": ("San Marcos", "TX"),
+    "city of mckinney": ("McKinney", "TX"),
+    "city of dallas gis services": ("Dallas", "TX"),
+    "city of greenwood, in": ("Greenwood", "IN"),
+    "city of new orleans": ("New Orleans", "LA"),
+    "columbia sc": ("Columbia", "SC"),
+    "columbiasc": ("Columbia", "SC"),
+    "lincoln nebraska": ("Lincoln", "NE"),
+    "louisville metro government": ("Louisville", "KY"),
+    "allegheny county / city of pittsburgh / western pa regional data center": ("Pittsburgh", "PA"),
+    "mecklenburg county gis": ("Charlotte", "NC"),
+    "town of flower mound gis": ("Flower Mound", "TX"),
+    "west chester university gis": ("West Chester", "PA"),
+    "pitt county government": ("Greenville", "NC"),
+    "overland park": ("Overland Park", "KS"),
+    "idaho falls": ("Idaho Falls", "ID"),
+    "sandy springs": ("Sandy Springs", "GA"),
+    "littlerock": ("Little Rock", "AR"),
+    "little rock": ("Little Rock", "AR"),
+    "montgomery county of maryland": ("Bethesda", "MD"),
+    "montgomerycountymd": ("Bethesda", "MD"),
+    "openmaryland": ("Baltimore", "MD"),
+    "rapid city": ("Rapid City", "SD"),
+    "ramseycountymn": ("Saint Paul", "MN"),
+    "princegeescountymd": ("Upper Marlboro", "MD"),
+    "kansas city ks": ("Kansas City", "KS"),
+    "brla": ("Baton Rouge", "LA"),
+    "baton rouge": ("Baton Rouge", "LA"),
+    "kcmo": ("Kansas City", "MO"),
+    "north las vegas": ("North Las Vegas", "NV"),
+    "cstx": ("College Station", "TX"),
+    "weho": ("West Hollywood", "CA"),
+    "internal sandiegocounty": ("San Diego", "CA"),
+    "dumfriesva": ("Dumfries", "VA"),
+    "ranchocordova": ("Rancho Cordova", "CA"),
+    "parkeronline": ("Parker", "CO"),
+    "auburnwa": ("Auburn", "WA"),
+    "gnb": ("New Bedford", "MA"),
+    "bloomington": ("Bloomington", "IN"),
+    "norfolk performance": ("Norfolk", "VA"),
+    "maricopa county": ("Phoenix", "AZ"),
+    "washoe county": ("Reno", "NV"),
+    "columbus ga": ("Columbus", "GA"),
+    "jackson mississippi": ("Jackson", "MS"),
+    "portland maine": ("Portland", "ME"),
+    "fulton county": ("Atlanta", "GA"),
+    "sharefulton": ("Atlanta", "GA"),
+    "great falls": ("Great Falls", "MT"),
+    "billings": ("Billings", "MT"),
+    "fargo": ("Fargo", "ND"),
+    "carson city": ("Carson City", "NV"),
+    "flint": ("Flint", "MI"),
+    "fort smith": ("Fort Smith", "AR"),
+    "springdale": ("Springdale", "AR"),
+    "corstat": ("Tampa", "FL"),
+    "openfc": ("Falls Church", "VA"),
+    "city of new bern gis": ("New Bern", "NC"),
+}
+
+# ── Known US City Coordinates (proper centroids, not from lead data) ──
+_KNOWN_CITY_COORDS: dict[tuple[str, str], tuple[float, float]] = {
+    ("new orleans", "LA"): (29.9511, -90.0715),
+    ("los angeles", "CA"): (34.0522, -118.2437),
+    ("chicago", "IL"): (41.8781, -87.6298),
+    ("new york", "NY"): (40.7128, -74.0060),
+    ("houston", "TX"): (29.7604, -95.3698),
+    ("phoenix", "AZ"): (33.4484, -112.0740),
+    ("philadelphia", "PA"): (39.9526, -75.1652),
+    ("san antonio", "TX"): (29.4241, -98.4936),
+    ("san diego", "CA"): (32.7157, -117.1611),
+    ("dallas", "TX"): (32.7767, -96.7970),
+    ("san jose", "CA"): (37.3382, -121.8863),
+    ("austin", "TX"): (30.2672, -97.7431),
+    ("jacksonville", "FL"): (30.3322, -81.6557),
+    ("san francisco", "CA"): (37.7749, -122.4194),
+    ("columbus", "OH"): (39.9612, -82.9988),
+    ("indianapolis", "IN"): (39.7684, -86.1581),
+    ("fort worth", "TX"): (32.7555, -97.3308),
+    ("charlotte", "NC"): (35.2271, -80.8431),
+    ("seattle", "WA"): (47.6062, -122.3321),
+    ("denver", "CO"): (39.7392, -104.9903),
+    ("washington", "DC"): (38.9072, -77.0369),
+    ("nashville", "TN"): (36.1627, -86.7816),
+    ("oklahoma city", "OK"): (35.4676, -97.5164),
+    ("el paso", "TX"): (31.7619, -106.4850),
+    ("boston", "MA"): (42.3601, -71.0589),
+    ("portland", "OR"): (45.5152, -122.6784),
+    ("las vegas", "NV"): (36.1699, -115.1398),
+    ("memphis", "TN"): (35.1495, -90.0490),
+    ("louisville", "KY"): (38.2527, -85.7585),
+    ("baltimore", "MD"): (39.2904, -76.6122),
+    ("milwaukee", "WI"): (43.0389, -87.9065),
+    ("albuquerque", "NM"): (35.0844, -106.6504),
+    ("tucson", "AZ"): (32.2226, -110.9747),
+    ("fresno", "CA"): (36.7378, -119.7871),
+    ("sacramento", "CA"): (38.5816, -121.4944),
+    ("mesa", "AZ"): (33.4152, -111.8315),
+    ("kansas city", "MO"): (39.0997, -94.5786),
+    ("kansas city", "KS"): (39.1141, -94.6275),
+    ("atlanta", "GA"): (33.7490, -84.3880),
+    ("omaha", "NE"): (41.2565, -95.9345),
+    ("colorado springs", "CO"): (38.8339, -104.8214),
+    ("raleigh", "NC"): (35.7796, -78.6382),
+    ("miami", "FL"): (25.7617, -80.1918),
+    ("long beach", "CA"): (33.7701, -118.1937),
+    ("virginia beach", "VA"): (36.8529, -75.9780),
+    ("oakland", "CA"): (37.8044, -122.2712),
+    ("minneapolis", "MN"): (44.9778, -93.2650),
+    ("tampa", "FL"): (27.9506, -82.4572),
+    ("tulsa", "OK"): (36.1540, -95.9928),
+    ("arlington", "TX"): (32.7357, -97.1081),
+    ("new orleans", "LA"): (29.9511, -90.0715),
+    ("pittsburgh", "PA"): (40.4406, -79.9959),
+    ("detroit", "MI"): (42.3314, -83.0458),
+    ("anchorage", "AK"): (61.2181, -149.9003),
+    ("cincinnati", "OH"): (39.1031, -84.5120),
+    ("st. louis", "MO"): (38.6270, -90.1994),
+    ("saint paul", "MN"): (44.9537, -93.0900),
+    ("cambridge", "MA"): (42.3736, -71.1097),
+    ("worcester", "MA"): (42.2626, -71.8023),
+    ("framingham", "MA"): (42.2793, -71.4162),
+    ("columbia", "SC"): (34.0007, -81.0348),
+    ("providence", "RI"): (41.8240, -71.4128),
+    ("orlando", "FL"): (28.5383, -81.3792),
+    ("gainesville", "FL"): (29.6516, -82.3248),
+    ("naperville", "IL"): (41.7508, -88.1535),
+    ("boulder", "CO"): (40.0150, -105.2705),
+    ("westminster", "CO"): (39.8367, -105.0372),
+    ("lincoln", "NE"): (40.8136, -96.7026),
+    ("idaho falls", "ID"): (43.4917, -112.0339),
+    ("overland park", "KS"): (38.9822, -94.6708),
+    ("sandy springs", "GA"): (33.9304, -84.3733),
+    ("little rock", "AR"): (34.7465, -92.2896),
+    ("bethesda", "MD"): (38.9847, -77.0947),
+    ("upper marlboro", "MD"): (38.8159, -76.7497),
+    ("greenville", "NC"): (35.6127, -77.3664),
+    ("baton rouge", "LA"): (30.4515, -91.1871),
+    ("norfolk", "VA"): (36.8508, -76.2859),
+    ("college station", "TX"): (30.6280, -96.3344),
+    ("west hollywood", "CA"): (34.0900, -118.3617),
+    ("dumfries", "VA"): (38.5679, -77.3283),
+    ("rancho cordova", "CA"): (38.5891, -121.3028),
+    ("parker", "CO"): (39.5186, -104.7614),
+    ("auburn", "WA"): (47.3073, -122.2285),
+    ("new bedford", "MA"): (41.6362, -70.9342),
+    ("bloomington", "IN"): (39.1653, -86.5264),
+    ("reno", "NV"): (39.5296, -119.8138),
+    ("north las vegas", "NV"): (36.1989, -115.1175),
+    ("columbus", "GA"): (32.4610, -84.9877),
+    ("jackson", "MS"): (32.2988, -90.1848),
+    ("portland", "ME"): (43.6591, -70.2568),
+    ("great falls", "MT"): (47.4942, -111.2833),
+    ("billings", "MT"): (45.7833, -108.5007),
+    ("fargo", "ND"): (46.8772, -96.7898),
+    ("carson city", "NV"): (39.1638, -119.7674),
+    ("flint", "MI"): (43.0125, -83.6875),
+    ("fort smith", "AR"): (35.3859, -94.3985),
+    ("springdale", "AR"): (36.1867, -94.1288),
+    ("falls church", "VA"): (38.8823, -77.1711),
+    ("new bern", "NC"): (35.1085, -77.0441),
+    ("dallas", "TX"): (32.7767, -96.7970),
+    ("mckinney", "TX"): (33.1972, -96.6397),
+    ("san marcos", "TX"): (29.8833, -97.9414),
+    ("greenwood", "IN"): (39.6136, -86.1066),
+    ("west chester", "PA"): (39.9607, -75.6055),
+    ("flower mound", "TX"): (33.0146, -97.0969),
+    ("rapid city", "SD"): (44.0805, -103.2310),
+}
+
 
 # Junk datasets to DROP entirely (not construction permits)
 _junk_drop_patterns = (
@@ -4480,6 +4846,11 @@ _junk_drop_patterns = (
     "right-of-way", "right of way",
     "food inspection", "health inspection",
 )
+# City values that are actually data source slugs — not real cities
+_junk_city_names = {
+    "data", "www", "opendata", "datahub", "mydata", "datatalog",
+    "datacatalog", "open", "unknown", "internal", "highways",
+}
 
 def _rebuild_cleaned_leads():
     """Pre-process raw cache once: fix coords, clean cities, normalize.
@@ -4487,6 +4858,16 @@ def _rebuild_cleaned_leads():
     global _cleaned_leads, _cleaned_leads_version
     import random as _rnd
     raw = DataCache.load(allow_stale=False) or DataCache.load(allow_stale=True) or []
+    # Fallback: load from SQLite if JSON cache is empty/missing
+    if not raw:
+        try:
+            from models.database import query_leads as _db_ql
+            db_leads, db_count = _db_ql(limit=500000)
+            if db_leads:
+                raw = db_leads
+                logger.info(f"_rebuild_cleaned_leads: loaded {len(raw):,} leads from SQLite (no JSON cache)")
+        except Exception as e:
+            logger.warning(f"SQLite fallback in rebuild failed: {e}")
     cleaned = []
     dropped_junk = 0
     assigned_centroid = 0
@@ -4550,6 +4931,7 @@ def _rebuild_cleaned_leads():
         return (bb[0] - pad) <= lat <= (bb[1] + pad) and (bb[2] - pad) <= lng <= (bb[3] + pad)
 
     # Build a quick city→coords lookup from leads that DO have valid coords
+    # Skip Kansas centroid leads and junk city names to avoid polluting the lookup
     _city_state_coords: dict[str, tuple[float, float]] = {}
     for l in raw:
         lat, lng = l.get("lat"), l.get("lng")
@@ -4557,10 +4939,16 @@ def _rebuild_cleaned_leads():
             try:
                 flat, flng = float(lat), float(lng)
                 if 17 <= flat <= 72 and -180 <= flng <= -65:
+                    # Exclude Kansas centroid area (fake coords)
+                    if abs(flat - 39.83) < 1.5 and abs(flng + 98.58) < 1.5:
+                        continue
                     st = str(l.get("state", "") or "").strip().upper()[:2]
                     if not _coords_match_state(flat, flng, st):
                         continue
-                    city_key = (str(l.get("city","") or "").strip().lower(), st)
+                    city_raw = str(l.get("city","") or "").strip().lower()
+                    if city_raw in _junk_city_names:
+                        continue
+                    city_key = (city_raw, st)
                     if city_key[0] and city_key not in _city_state_coords:
                         _city_state_coords[city_key] = (flat, flng)
             except (ValueError, TypeError):
@@ -4572,6 +4960,27 @@ def _rebuild_cleaned_leads():
         if any(p in city_raw for p in _junk_drop_patterns):
             dropped_junk += 1
             continue
+
+        # ── Normalize city name from source slugs ──
+        raw_city = str(l.get("city", "") or "").strip()
+        raw_source = str(l.get("source", "") or "").strip()
+        city_lookup = raw_city.lower()
+        source_lookup = raw_source.lower()
+        # Try city field first, then source field
+        if city_lookup in _CITY_NAME_FIXES:
+            real_city, real_st = _CITY_NAME_FIXES[city_lookup]
+            l = dict(l)  # avoid mutating original
+            l["city"] = real_city
+            if not l.get("state") or str(l.get("state", "")).strip() == "":
+                l["state"] = real_st
+        elif source_lookup in _CITY_NAME_FIXES:
+            real_city, real_st = _CITY_NAME_FIXES[source_lookup]
+            l = dict(l)
+            if not l.get("city") or str(l.get("city", "")).strip() == "":
+                l["city"] = real_city
+            if not l.get("state") or str(l.get("state", "")).strip() == "":
+                l["state"] = real_st
+
         # Validate and fix coordinates — fallback to centroid if missing
         lat, lng = l.get("lat"), l.get("lng")
         flat, flng = None, None
@@ -4583,6 +4992,11 @@ def _rebuild_cleaned_leads():
                 # Reject State Plane / projected coordinates (values > 10000)
                 if abs(flat) > 10000 or abs(flng) > 10000:
                     flat, flng = None, None
+                # Reject Kansas centroid from DB (these are fake coords, not real)
+                elif abs(flat - 39.83) < 1.5 and abs(flng + 98.58) < 1.5:
+                    # Check if lead is actually in Kansas
+                    if lead_state not in ("KS", "NE"):
+                        flat, flng = None, None  # force re-geocoding via centroid
                 else:
                     flat, flng = fix_coordinates(flat, flng)
                     # Reject coords that don't match the lead's state
@@ -4590,21 +5004,30 @@ def _rebuild_cleaned_leads():
                         flat, flng = None, None
             except (ValueError, TypeError):
                 flat, flng = None, None
-        # Fallback: use city centroid or state centroid
+        # Fallback chain: known city coords → lead-derived city centroid → state centroid
+        # geo_quality: True = real coords, "city" = city-level, False = state/US centroid
+        geo_quality = True  # assume real coords unless we fall through
         if flat is None or flng is None:
             city_val = str(l.get("city", "") or "").strip().lower()
             state_val = str(l.get("state", "") or "").strip().upper()[:2]
             city_key = (city_val, state_val)
-            if city_key[0] and city_key in _city_state_coords:
+            # 1. Try known city coordinates (accurate, curated)
+            if city_key in _KNOWN_CITY_COORDS:
+                flat, flng = _KNOWN_CITY_COORDS[city_key]
+                geo_quality = "city"
+            # 2. Try city centroid from other leads with valid coords
+            elif city_key[0] and city_key in _city_state_coords:
                 flat, flng = _city_state_coords[city_key]
-                coords_from_centroid = True
+                geo_quality = "city"
+            # 3. Try state centroid
             elif state_val in _state_centroids:
                 flat, flng = _state_centroids[state_val]
-                coords_from_centroid = True
+                geo_quality = False
             else:
                 # Last resort: center of US
                 flat, flng = 39.83, -98.58
-                coords_from_centroid = True
+                geo_quality = False
+            coords_from_centroid = True
         if coords_from_centroid:
             # Add small random offset so points don't stack exactly
             flat += _rnd.uniform(-0.08, 0.08)
@@ -4614,6 +5037,7 @@ def _rebuild_cleaned_leads():
         cl = dict(l)
         cl["lat"] = flat
         cl["lng"] = flng
+        cl["_geocoded"] = geo_quality  # True=real, "city"=city-level, False=state/US centroid
         # Fix JSON-corrupted address fields (Socrata location objects stored as strings)
         addr_raw = str(cl.get("address", "") or "").strip()
         if addr_raw.startswith("{") and "human_address" in addr_raw:
@@ -4646,6 +5070,7 @@ def _rebuild_cleaned_leads():
                 city_low = city_val.lower().strip()
                 break
         if (city_low in ("unknown", "not provided", "n/a", "none", "various", "other", "")
+                or city_low in _junk_city_names
                 or any(p in city_low for p in _bad_city_patterns)
                 or city_low in _state_names_set
                 or len(city_val) > 40):
@@ -4664,12 +5089,9 @@ def _rebuild_cleaned_leads():
                 from datetime import datetime as _dt
                 issued = _dt.fromisoformat(str(issue_date).replace('Z', '+00:00'))
                 days_old = (_dt.now() - issued).days
-            except Exception:
+            except (ValueError, TypeError):
                 pass
-        try:
-            valuation = float(cl.get("valuation") or 0)
-        except (ValueError, TypeError):
-            valuation = 0.0
+        valuation = safe_float(cl.get("valuation"))
         permit_type = str(cl.get("permit_type") or "")
         new_score, new_temp, _ = calculate_score(days_old, valuation, permit_type)
         cl["score"] = new_score
@@ -4685,6 +5107,46 @@ def _rebuild_cleaned_leads():
     logger.info(f"Pre-processed {len(cleaned):,} clean leads from {len(raw):,} raw "
                 f"(dropped: {dropped_junk:,} junk, centroid-placed: {assigned_centroid:,}) "
                 f"v{_cleaned_leads_version}")
+
+
+@app.get("/api/leads/map")
+async def get_leads_map():
+    """Lightweight map endpoint — returns only [id, lat, lng, pri_int, score, city] per lead.
+    Reduces payload from ~300MB (full leads) to ~5MB (6 fields per lead).
+    pri_int: 0=hot, 1=warm, 2=med, 3=cold
+    """
+    _PRI_MAP = {"hot": 0, "warm": 1, "med": 2, "cold": 3}
+
+    if not _cleaned_leads:
+        # Kick off cache rebuild if needed, serve empty for now
+        asyncio.get_event_loop().run_in_executor(None, _rebuild_cleaned_leads)
+        return {"points": [], "total": 0, "source": "cache_loading"}
+
+    points = []
+    for lead in _cleaned_leads:
+        lat = lead.get("lat")
+        lng = lead.get("lng")
+        if lat is None or lng is None:
+            continue
+        try:
+            lat_f = float(lat)
+            lng_f = float(lng)
+        except (ValueError, TypeError):
+            continue
+        # Skip leads with no valid coordinates
+        if lat_f == 0.0 and lng_f == 0.0:
+            continue
+
+        lead_id = str(lead.get("id", ""))
+        temp = str(lead.get("temperature", "med"))
+        pri_int = _PRI_MAP.get(temp, 2)
+        score = int(lead.get("score", 50))
+        city = str(lead.get("city", ""))
+        geocoded = lead.get("_geocoded", True)
+
+        points.append([lead_id, lat_f, lng_f, pri_int, score, city, geocoded])
+
+    return {"points": points, "total": len(points), "source": "cache"}
 
 
 @app.get("/api/leads")
@@ -4752,10 +5214,10 @@ async def get_leads(
 
     filtered = apply_access_filter(_cleaned_leads, request)
 
-    # Fast server-side age filter (uses pre-computed days_old, very cheap)
+    # Fast server-side age filter (compute days_old live to avoid stale cache)
     if max_days_old is not None:
         filtered = [l for l in filtered
-                    if (l.get("days_old") or 0) <= max_days_old or (l.get("days_old") or 0) == 0]
+                    if (_live_days_old(l) or 0) <= max_days_old or (_live_days_old(l) or 0) == 0]
 
     # Apply lightweight filters (no dict copy needed — read-only until normalization)
     if days:
@@ -4793,8 +5255,8 @@ async def get_leads(
                         "lead_score", "address", "permit_type", "valuation", "days_old",
                         "source", "owner_name", "is_sold"}
     if field_set and field_set.issubset(_map_only_fields):
-        # Fast path: no readiness/normalization needed — data already pre-processed
-        result = [{k: v for k, v in l.items() if k in field_set} for l in result]
+        # Fast path: no readiness/normalization needed — but recompute days_old live
+        result = [{k: v for k, v in _with_live_days_old(l).items() if k in field_set} for l in result]
     else:
         _readiness_fields = {"readiness_score", "recommended_action", "contact_window_days", "budget_range", "competition_level"}
         if not field_set or bool(field_set & _readiness_fields):
@@ -4915,6 +5377,67 @@ async def debug_cache_state():
     }
 
 
+@app.post("/api/leads")
+async def create_lead(request: Request):
+    """Create a new lead manually."""
+    body = await request.json()
+
+    # Validate required fields
+    address = str(body.get("address", "")).strip()
+    if not address:
+        raise HTTPException(status_code=400, detail="Address is required")
+
+    city = str(body.get("city", "")).strip()
+    state = str(body.get("state", "")).strip()
+    zip_code = str(body.get("zip", "")).strip()
+
+    lead_id = str(uuid.uuid4())[:12]
+
+    lead = {
+        "id": lead_id,
+        "address": address,
+        "city": city,
+        "state": state,
+        "zip": zip_code,
+        "owner_name": str(body.get("owner_name", "")).strip(),
+        "phone": str(body.get("phone", "")).strip(),
+        "email": str(body.get("email", "")).strip(),
+        "type": str(body.get("work_type", "")).strip() or "Residential",
+        "valuation": safe_float(body.get("project_value")),
+        "permit_number": str(body.get("permit_number", "")).strip(),
+        "description": str(body.get("description", "")).strip(),
+        "source": "manual",
+        "issue_date": datetime.now().strftime("%Y-%m-%d"),
+        "score": 50,
+        "temperature": "med",
+        "_geocoded": False,
+    }
+
+    # Save to SQLite
+    try:
+        conn = _leads_conn()
+        conn.execute("""
+            INSERT INTO leads (id, address, city, state, zip, owner_name, phone, email,
+                             type, valuation, permit_number, description, source, issue_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (lead_id, address, city, state, zip_code, lead["owner_name"], lead["phone"],
+              lead["email"], lead["type"], lead["valuation"], lead["permit_number"],
+              lead["description"], "manual", lead["issue_date"]))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("Failed to save manual lead: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to save lead")
+
+    # Add to in-memory cache
+    if _cleaned_leads is not None:
+        _cleaned_leads.append(lead)
+        if _cleaned_leads_by_id is not None:
+            _cleaned_leads_by_id[lead_id] = lead
+
+    return {"status": "ok", "lead": lead}
+
+
 @app.post("/api/leads/{lead_id}/stage")
 async def update_lead_stage(lead_id: str, request: Request):
     """Update lead stage for CRM pipeline (new UI)."""
@@ -4923,20 +5446,13 @@ async def update_lead_stage(lead_id: str, request: Request):
         stage = body.get("stage", "new")
 
         # Validate stage
-        valid_stages = ["new", "contacted", "quoted", "proposed", "won", "lost"]
+        valid_stages = ["new", "contacted", "quoted", "proposed", "won", "lost", "scheduled", "follow_up"]
         if stage not in valid_stages:
             return {"success": False, "error": f"Invalid stage. Must be one of: {valid_stages}"}
 
-        # Save to market.db
-        conn = _conn()
+        # Save to leads.db (consolidated pipeline storage)
+        conn = _leads_conn()
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS lead_stages (
-                lead_id TEXT PRIMARY KEY,
-                stage TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
         cur.execute(
             "INSERT OR REPLACE INTO lead_stages (lead_id, stage, updated_at) VALUES (?, ?, ?)",
             (lead_id, stage, datetime.utcnow().isoformat())
@@ -4955,9 +5471,8 @@ async def update_lead_stage(lead_id: str, request: Request):
 async def get_all_stages():
     """Return all saved lead stages + timestamps for frontend hydration."""
     try:
-        conn = _conn()
+        conn = _leads_conn()
         cur = conn.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS lead_stages (lead_id TEXT PRIMARY KEY, stage TEXT NOT NULL, updated_at TEXT NOT NULL)")
         cur.execute("SELECT lead_id, stage, updated_at FROM lead_stages")
         rows = cur.fetchall()
         conn.close()
@@ -5169,8 +5684,12 @@ async def trigger_intent_sync():
 
 
 @app.post("/api/sync")
-async def trigger_sync(background_tasks: BackgroundTasks):
+async def trigger_sync(request: Request, background_tasks: BackgroundTasks):
     """Manually trigger data sync"""
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    payload = decode_jwt_token(token)
+    if not payload:
+        raise HTTPException(401, "Not authenticated")
     background_tasks.add_task(sync_data)
     return {"message": "Sync started", "status": "processing"}
 
@@ -5368,8 +5887,8 @@ async def propertyreach_search(street: str, city: str, state: str, zip_code: str
                             zip_s = top.get("zip") or zip_code
                             # retry skip trace (address only) with sanitized components
                             data, serr = await skip_trace(session, key, prop_id=None)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Skip trace address suggestion retry failed: %s", e)
                 if not data:
                     last_error = serr or perr
                     continue
@@ -5586,6 +6105,80 @@ async def send_invite(request: Request):
     return {"success": True, "message": f"Invite queued for {phone}", "note": "SMS delivery requires Twilio configuration in Settings"}
 
 
+# ── Settings persistence ──
+
+@app.get("/api/settings")
+async def get_settings(request: Request):
+    """Get user settings."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        parts = token.split(".")
+        pad = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+        user_id = payload.get("sub", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        import sqlite3
+        conn = _leads_conn()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT settings_json FROM users WHERE id = ?", (user_id,)).fetchone()
+        conn.close()
+        if row and row["settings_json"]:
+            return json.loads(row["settings_json"])
+    except Exception as e:
+        logger.debug("Settings fetch: %s", e)
+    return {}
+
+
+@app.put("/api/settings")
+async def update_settings(request: Request):
+    """Update user settings (merge with existing)."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        parts = token.split(".")
+        pad = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+        user_id = payload.get("sub", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    body = await request.json()
+
+    # Ensure settings_json column exists
+    try:
+        conn = _leads_conn()
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN settings_json TEXT DEFAULT '{}'")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+
+        # Merge with existing settings
+        existing = {}
+        row = conn.execute("SELECT settings_json FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row and row[0]:
+            try:
+                existing = json.loads(row[0])
+            except Exception:
+                pass
+
+        merged = {**existing, **body}
+        conn.execute("UPDATE users SET settings_json = ? WHERE id = ?", (json.dumps(merged), user_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("Settings save failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to save settings")
+
+    return {"status": "ok", "settings": merged}
+
+
 @app.get("/api/health")
 async def health_check():
     """API health check"""
@@ -5640,8 +6233,8 @@ async def prometheus_metrics():
         from models.database import get_db
         with get_db() as conn:
             db_count = conn.execute("SELECT COUNT(*) FROM leads WHERE is_active = 1").fetchone()[0]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Metrics db count query failed: %s", e)
 
     lines = [
         "# HELP onsite_leads_total Total number of leads",
@@ -5684,7 +6277,7 @@ async def analytics_activity(days: int = 30):
                 if dt >= cutoff:
                     date_key = dt.strftime("%Y-%m-%d")
                     activity[date_key] += 1
-            except:
+            except (ValueError, TypeError):
                 pass
 
     # Sort by date
@@ -5744,21 +6337,102 @@ async def analytics_neighborhoods(limit: int = 10):
 
 @app.get("/api/analytics/funnel")
 async def analytics_funnel():
-    """Conversion funnel stats (for funnel chart)"""
+    """Conversion funnel stats — combines score-based counts with real pipeline stages."""
     cached = DataCache.load(allow_stale=True)
     if not cached:
         return {"stages": [], "counts": []}
 
     total = len(cached)
-    # Score-based counts (80/60/40 thresholds)
-    hot = sum(1 for p in cached if float(p.get("score", 0) or 0) >= 80)
-    warm = sum(1 for p in cached if 60 <= float(p.get("score", 0) or 0) < 80)
-    contacted = sum(1 for p in cached if p.get("owner_phone"))
+    hot = sum(1 for p in cached if safe_float(p.get("score")) >= TEMP_THRESHOLDS["hot"])
+    warm = sum(1 for p in cached if TEMP_THRESHOLDS["warm"] <= safe_float(p.get("score")) < TEMP_THRESHOLDS["hot"])
+
+    # Pull real pipeline stage counts from leads.db
+    stage_counts = {"contacted": 0, "quoted": 0, "proposed": 0, "won": 0, "lost": 0}
+    try:
+        conn = _leads_conn()
+        cur = conn.cursor()
+        rows = cur.execute("SELECT stage, COUNT(*) FROM lead_stages GROUP BY stage").fetchall()
+        conn.close()
+        for stage, cnt in rows:
+            if stage in stage_counts:
+                stage_counts[stage] = cnt
+    except Exception as e:
+        logger.error("Failed to query lead_stages for pipeline counts: %s", e)
 
     return {
-        "stages": ["All Leads", "Hot Leads", "Warm Leads", "Has Contact"],
-        "counts": [total, hot, warm, contacted]
+        "stages": ["All Leads", "Hot Leads", "Warm Leads", "Contacted", "Quoted", "Won"],
+        "counts": [total, hot, warm, stage_counts["contacted"], stage_counts["quoted"], stage_counts["won"]]
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ZIP RISK DATA ENDPOINT — Per-ZIP flood, disaster, market data
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/zip-risk/{zip_code}")
+async def zip_risk_data(zip_code: str):
+    """Return ZIP-level risk and market data."""
+    zip_code = zip_code.strip()[:5]
+    if len(zip_code) < 5:
+        raise HTTPException(status_code=400, detail="Invalid ZIP code")
+    try:
+        from data_sources.schema import get_db as get_ds_db
+        with get_ds_db() as conn:
+            row = conn.execute(
+                "SELECT zip_code, city, county, state, lat, lng, "
+                "nfip_flood_claims_count, nfip_flood_total_paid_usd, "
+                "fema_disaster_count, fema_disaster_types, "
+                "fema_ia_registrations, fema_ia_approved_usd, "
+                "fhfa_hpi_index, fhfa_hpi_year, "
+                "census_permits_count, city_portal_permits_count "
+                "FROM zip_risk_data WHERE zip_code = ?", (zip_code,)
+            ).fetchone()
+            if not row:
+                return {"found": False, "zip_code": zip_code}
+            return {
+                "found": True,
+                "zip_code": row[0], "city": row[1], "county": row[2], "state": row[3],
+                "lat": row[4], "lng": row[5],
+                "flood_claims": row[6], "flood_total_paid": row[7],
+                "disaster_count": row[8], "disaster_types": row[9],
+                "ia_registrations": row[10], "ia_approved_usd": row[11],
+                "hpi_index": row[12], "hpi_year": row[13],
+                "census_permits": row[14], "city_portal_permits": row[15],
+            }
+    except Exception as e:
+        logger.error("ZIP risk lookup failed: %s", e)
+        return {"found": False, "zip_code": zip_code, "error": str(e)}
+
+
+@app.get("/api/data-sources/stats")
+async def data_sources_stats():
+    """Return summary stats of collected data sources."""
+    try:
+        from data_sources.schema import get_db as get_ds_db
+        with get_ds_db() as conn:
+            ds_count = conn.execute("SELECT COUNT(*) FROM data_sources").fetchone()[0]
+            zip_count = conn.execute("SELECT COUNT(*) FROM zip_risk_data").fetchone()[0]
+            ds_cats = conn.execute(
+                "SELECT category, COUNT(*) FROM data_sources GROUP BY category ORDER BY COUNT(*) DESC"
+            ).fetchall()
+
+            fema_d = 0
+            fema_c = 0
+            try:
+                fema_d = conn.execute("SELECT COUNT(*) FROM fema_disasters").fetchone()[0]
+                fema_c = conn.execute("SELECT COUNT(*) FROM fema_flood_claims").fetchone()[0]
+            except Exception as e:
+                logger.debug("FEMA tables not yet created: %s", e)
+
+            return {
+                "data_sources": ds_count,
+                "zip_codes_covered": zip_count,
+                "fema_disasters": fema_d,
+                "fema_flood_claims": fema_c,
+                "categories": {cat: cnt for cat, cnt in ds_cats},
+            }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5893,7 +6567,7 @@ async def crm_sync_leads(crm_name: str, lead_ids: List[int] = None):
         leads_to_sync = [lead for lead in cached if lead.get("id") in lead_ids]
     else:
         # Sync all hot leads by default
-        leads_to_sync = [lead for lead in cached if lead.get("temperature") == "Hot"][:50]
+        leads_to_sync = [lead for lead in cached if lead.get("temperature") == "hot"][:50]
 
     if not leads_to_sync:
         return {"success": False, "error": "No leads to sync"}
@@ -5907,13 +6581,15 @@ async def crm_sync_leads(crm_name: str, lead_ids: List[int] = None):
 # ═══════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/campaigns/email/send")
-async def send_email_campaign(
-    to_email: str,
-    subject: str,
-    html_content: str,
-    plain_content: str = ""
-):
+async def send_email_campaign(request: Request):
     """Send a single email"""
+    body = await request.json()
+    to_email = body.get("to_email", "")
+    subject = body.get("subject", "")
+    html_content = body.get("html_content", "")
+    plain_content = body.get("plain_content", "")
+    if not to_email or not subject:
+        raise HTTPException(status_code=400, detail="to_email and subject are required")
     result = await email_service.send_single_email(
         to_email=to_email,
         subject=subject,
@@ -5953,7 +6629,7 @@ async def send_daily_digest_email(contractor_email: str, days: int = 1):
                 dt = datetime.fromisoformat(issue_date.replace("Z", "+00:00"))
                 if dt >= cutoff:
                     recent_leads.append(lead)
-            except:
+            except (ValueError, TypeError):
                 pass
 
     if not recent_leads:
@@ -5989,8 +6665,13 @@ async def sms_bulk(request: Request):
 
 
 @app.post("/api/campaigns/sms/send")
-async def send_sms_campaign(to_number: str, message: str):
+async def send_sms_campaign(request: Request):
     """Send a single SMS"""
+    body = await request.json()
+    to_number = body.get("to_phone", "") or body.get("to_number", "")
+    message = body.get("message", "")
+    if not to_number or not message:
+        raise HTTPException(status_code=400, detail="to_phone and message are required")
     result = await sms_service.send_sms(to_number=to_number, message=message)
     return result
 
@@ -6029,9 +6710,9 @@ async def send_daily_summary_sms(contractor_phone: str):
                 if dt >= cutoff:
                     new_leads += 1
                     total_value += float(lead.get("valuation", 0) or 0)
-                    if lead.get("temperature") == "Hot":
+                    if lead.get("temperature") == "hot":
                         hot_leads += 1
-            except:
+            except (ValueError, TypeError):
                 pass
 
     stats = {
@@ -6308,7 +6989,11 @@ except ImportError as e:
 # Admin health endpoints (read-only)
 # ---------------------------------------------------------------------------
 @app.get("/admin/system/queues")
-async def admin_queues():
+async def admin_queues(request: Request):
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    payload = decode_jwt_token(token)
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
     conn = _conn()
     cur = conn.cursor()
     cur.execute("SELECT count(*) FROM failed_leads_queue")
@@ -6320,7 +7005,11 @@ async def admin_queues():
 
 
 @app.get("/admin/system/billing")
-async def admin_billing():
+async def admin_billing(request: Request):
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    payload = decode_jwt_token(token)
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
     conn = _conn()
     cur = conn.cursor()
     cur.execute("SELECT status, count(*) FROM subscriptions GROUP BY status")
@@ -6329,8 +7018,81 @@ async def admin_billing():
     return {"subscriptions": {r[0]: r[1] for r in rows}}
 
 
+@app.get("/admin/system/cache-status")
+async def admin_cache_status(request: Request):
+    """Check alignment between JSON cache and SQLite DB."""
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    payload = decode_jwt_token(token)
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
+    cache_count = len(_cleaned_leads) if _cleaned_leads else 0
+    db_count = 0
+    try:
+        from models.database import get_db
+        with get_db() as db:
+            db_count = db.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+    except Exception as e:
+        logger.debug("Cache status db query failed: %s", e)
+    ratio = (min(db_count, cache_count) / max(db_count, cache_count) * 100) if max(db_count, cache_count) > 0 else 100
+    return {
+        "cache_count": cache_count,
+        "db_count": db_count,
+        "alignment_pct": round(ratio, 1),
+        "status": "ok" if ratio >= 80 else "misaligned",
+    }
+
+
+@app.get("/admin/system/memory")
+async def admin_memory_status(request: Request):
+    """Monitor memory usage of in-memory caches and process."""
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    payload = decode_jwt_token(token)
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
+    import sys
+    import os as _os
+
+    process_mb = 0
+    try:
+        # Linux /proc/self/status RSS
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    process_mb = int(line.split()[1]) / 1024
+                    break
+    except Exception:
+        try:
+            import resource
+            process_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        except Exception:
+            pass
+
+    cleaned_count = len(_cleaned_leads) if _cleaned_leads else 0
+    by_id_count = len(_cleaned_leads_by_id) if _cleaned_leads_by_id else 0
+    resp_cache_count = len(_response_cache)
+    disaster_count = len(_disaster_cache)
+
+    # Estimate sizes
+    cleaned_est_mb = (sys.getsizeof(_cleaned_leads) + sum(sys.getsizeof(l) for l in _cleaned_leads[:100]) * (cleaned_count / 100 if cleaned_count > 100 else 1)) / (1024 * 1024) if _cleaned_leads else 0
+    resp_cache_mb = sum(len(v[1]) for v in _response_cache.values()) / (1024 * 1024) if _response_cache else 0
+
+    return {
+        "process_rss_mb": round(process_mb, 1),
+        "caches": {
+            "cleaned_leads": {"count": cleaned_count, "est_mb": round(cleaned_est_mb, 1)},
+            "cleaned_leads_by_id": {"count": by_id_count},
+            "response_cache": {"count": resp_cache_count, "size_mb": round(resp_cache_mb, 1)},
+            "disaster_cache": {"states_cached": disaster_count, "ttl_hours": _DISASTER_CACHE_TTL / 3600},
+        },
+    }
+
+
 @app.get("/admin/system/territories")
-async def admin_territories():
+async def admin_territories(request: Request):
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    payload = decode_jwt_token(token)
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
     conn = _conn()
     cur = conn.cursor()
     cur.execute("SELECT zip_code, SUM(active_count) FROM territory_seats GROUP BY zip_code")
@@ -6340,13 +7102,39 @@ async def admin_territories():
 
 
 @app.get("/admin/system/failures")
-async def admin_failures():
+async def admin_failures(request: Request):
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    payload = decode_jwt_token(token)
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
     conn = _conn()
     cur = conn.cursor()
     cur.execute("SELECT id, error FROM failed_leads_queue LIMIT 20")
     rows = cur.fetchall()
     conn.close()
     return {"failed_leads": rows}
+
+
+@app.get("/admin/system/user-count")
+async def admin_user_count(request: Request):
+    """Return count of active users for admin KPI."""
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    payload = decode_jwt_token(token)
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
+    conn = _leads_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+        count = cur.fetchone()[0]
+    except Exception:
+        try:
+            cur.execute("SELECT COUNT(*) FROM users")
+            count = cur.fetchone()[0]
+        except Exception:
+            count = 0
+    conn.close()
+    return {"count": count}
 
 
 # ---------------------------------------------------------------------------
@@ -6464,7 +7252,8 @@ def _transform_lead(lead: dict) -> dict:
     # Field renames (keep originals too for backward compat)
     out["lead_score"] = out.get("score") or 0
     out["project_value"] = out.get("valuation") or 0
-    out["days_since_issued"] = out.get("days_old") or 0
+    out["days_old"] = _live_days_old(out)
+    out["days_since_issued"] = out["days_old"]
     out["issued_date"] = out.get("issue_date") or ""
     out["status"] = out.get("temperature") or out.get("status") or "Unknown"
     out["state"] = out.get("state") or _infer_state(out.get("city", ""))
@@ -6598,7 +7387,7 @@ async def compat_permits(
                         pass
             # Default to 30-day cap (matches frontend hard cap)
             effective_days = days if days else MAX_DAYS_OLD
-            filtered = [l for l in filtered if (l.get("days_old") or 999) <= effective_days]
+            filtered = [l for l in filtered if (_live_days_old(l) or 999) <= effective_days]
             if insurance:
                 filtered = [l for l in filtered if _is_insurance_claim(l)]
 
@@ -6615,18 +7404,20 @@ async def compat_permits(
             # Batch-load pipeline stages from DB (only for paginated results)
             stage_map = {}
             notes_map = {}
+            conn = None
             try:
-                conn = _conn()
+                conn = _leads_conn()
                 cur = conn.cursor()
-                cur.execute("CREATE TABLE IF NOT EXISTS lead_stages (lead_id INTEGER PRIMARY KEY, stage TEXT, updated_at TEXT)")
                 cur.execute("SELECT lead_id, stage FROM lead_stages")
                 stage_map = {row[0]: row[1] for row in cur.fetchall()}
                 cur.execute("CREATE TABLE IF NOT EXISTS lead_notes (lead_id INTEGER PRIMARY KEY, notes TEXT, updated_at TEXT)")
                 cur.execute("SELECT lead_id, notes FROM lead_notes")
                 notes_map = {row[0]: row[1] for row in cur.fetchall()}
-                conn.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Failed to load lead stages/notes from db: %s", e)
+            finally:
+                if conn:
+                    conn.close()
 
             # Apply pagination AFTER filtering and sorting
             effective_limit = min(limit or 1000, LEADS_RETURN_LIMIT)
@@ -6660,7 +7451,7 @@ def _in_bbox(lead: dict, south: float, west: float, north: float, east: float) -
 
 
 @app.get("/api/permits/{permit_id}")
-async def compat_permit_detail(permit_id: int):
+async def compat_permit_detail(permit_id: str):
     """On Site compat — single lead detail with renamed fields."""
     lead = _get_permit_from_cache(permit_id)
     if not lead:
@@ -6682,7 +7473,7 @@ async def compat_permit_detail(permit_id: int):
 
 
 @app.post("/api/permits/{permit_id}/enrich")
-async def compat_enrich(permit_id: int):
+async def compat_enrich(permit_id: str):
     """On Site compat — wraps free ownership enrichment pipeline."""
     lead = _get_permit_from_cache(permit_id)
     if not lead:
@@ -6702,8 +7493,8 @@ async def compat_enrich(permit_id: int):
                 for k, v in result.items():
                     if v and not lead.get(k):
                         lead[k] = v
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("LA owner enrichment failed for APN %s: %s", lead.get("apn"), e)
     # Persist enrichment back to SQLite
     try:
         from models.database import update_lead
@@ -6716,8 +7507,8 @@ async def compat_enrich(permit_id: int):
             "enrichment_status": "enriched" if lead.get("owner_name") else "failed",
         }
         update_lead(permit_id, {k: v for k, v in updates.items() if v})
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Failed to persist enrichment for permit %s: %s", permit_id, e)
     return _transform_lead(lead)
 
 
@@ -6759,7 +7550,7 @@ async def compat_history(permit_id: str):
 
 
 @app.post("/api/permits/{permit_id}/stage")
-async def compat_save_stage(permit_id: int, payload: dict):
+async def compat_save_stage(permit_id: str, payload: dict):
     """On Site compat — save pipeline stage for a lead."""
     stage = payload.get("stage", "")
     try:
@@ -6781,7 +7572,7 @@ async def compat_save_stage(permit_id: int, payload: dict):
 
 
 @app.post("/api/permits/{permit_id}/notes")
-async def compat_save_notes(permit_id: int, payload: dict):
+async def compat_save_notes(permit_id: str, payload: dict):
     """On Site compat — save notes for a lead."""
     notes = payload.get("notes", "")
     try:
@@ -6803,7 +7594,7 @@ async def compat_save_notes(permit_id: int, payload: dict):
 
 
 @app.post("/api/permits/{permit_id}/tags")
-async def compat_save_tags(permit_id: int, payload: dict):
+async def compat_save_tags(permit_id: str, payload: dict):
     """On Site compat — save tags for a lead."""
     tags = payload.get("tags", [])
     try:
@@ -6825,7 +7616,7 @@ async def compat_save_tags(permit_id: int, payload: dict):
 
 
 @app.get("/api/permits/{permit_id}/score-breakdown")
-async def compat_score_breakdown(permit_id: int):
+async def compat_score_breakdown(permit_id: str):
     """On Site compat — score component breakdown."""
     lead = _get_permit_from_cache(permit_id)
     if not lead:
@@ -6833,7 +7624,7 @@ async def compat_score_breakdown(permit_id: int):
     lead = compute_readiness(dict(lead))
     score = lead.get("score", 0)
     val = lead.get("valuation", 0)
-    days = lead.get("days_old", 0)
+    days = _live_days_old(lead)
     # Approximate component scores
     urgency_pts = max(0, min(35, 35 - days))
     value_pts = min(30, int((val / 500000) * 30)) if val else 5
@@ -6851,7 +7642,7 @@ async def compat_score_breakdown(permit_id: int):
 
 
 @app.get("/api/permits/{permit_id}/comparables")
-async def compat_comparables(permit_id: int):
+async def compat_comparables(permit_id: str):
     """On Site compat — nearby similar permits."""
     lead = _get_permit_from_cache(permit_id)
     if not lead:
@@ -6871,7 +7662,7 @@ async def compat_comparables(permit_id: int):
 
 
 @app.get("/api/permits/{permit_id}/competitors")
-async def compat_competitors(permit_id: int):
+async def compat_competitors(permit_id: str):
     """On Site compat — leads with contractor already listed (competition)."""
     lead = _get_permit_from_cache(permit_id)
     if not lead:
@@ -6893,7 +7684,7 @@ async def compat_competitors(permit_id: int):
 
 
 @app.post("/api/permits/{permit_id}/skip-trace")
-async def compat_skip_trace(permit_id: int):
+async def compat_skip_trace(permit_id: str):
     """On Site compat — wraps PropertyReach skip-trace."""
     lead = _get_permit_from_cache(permit_id)
     if not lead:
@@ -6902,7 +7693,7 @@ async def compat_skip_trace(permit_id: int):
         result = await propertyreach_search(
             lead.get("address", ""),
             lead.get("city", ""),
-            "CA",
+            lead.get("state", "CA"),
             lead.get("zip", ""),
         )
         return {"success": True, "data": result}
@@ -6911,31 +7702,41 @@ async def compat_skip_trace(permit_id: int):
 
 
 @app.post("/api/permits/{permit_id}/contact")
-async def record_contact_attempt(permit_id: int, payload: dict):
+async def record_contact_attempt(permit_id: str, payload: dict):
     """Record contact attempt for a lead"""
     try:
-        conn = _conn()
-        cur = conn.cursor()
+        now_iso = datetime.utcnow().isoformat()
 
-        # Update contacted_at timestamp
-        cur.execute(
-            "UPDATE leads SET contacted_at = ?, updated_at = ? WHERE id = ?",
-            (datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), permit_id)
-        )
+        # Update lead_stages in leads.db
+        conn = _leads_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO lead_stages (lead_id, stage, updated_at) VALUES (?, ?, ?)",
+                (str(permit_id), "contacted", now_iso),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
-        # Log the contact in pipeline history
-        cur.execute(
-            """INSERT INTO pipeline_history (lead_id, from_stage, to_stage, notes, timestamp)
-               VALUES (?, ?, ?, ?, ?)""",
-            (permit_id, "new", "contacted",
-             payload.get("notes", "Contact attempt recorded"),
-             datetime.utcnow().isoformat())
-        )
+        # Log in pipeline_history (leads.db via get_db)
+        try:
+            with get_db() as db:
+                db.execute(
+                    """CREATE TABLE IF NOT EXISTS pipeline_history
+                       (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        lead_id TEXT, from_stage TEXT, to_stage TEXT,
+                        notes TEXT, timestamp TEXT)""")
+                db.execute(
+                    """INSERT INTO pipeline_history (lead_id, from_stage, to_stage, notes, timestamp)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (str(permit_id), "new", "contacted",
+                     payload.get("notes", "Contact attempt recorded"), now_iso),
+                )
+        except Exception:
+            pass  # Non-critical history logging
 
-        conn.commit()
-        conn.close()
-
-        return {"status": "ok", "lead_id": permit_id, "contacted_at": datetime.utcnow().isoformat()}
+        return {"status": "ok", "lead_id": permit_id, "contacted_at": now_iso}
     except Exception as e:
         logger.error(f"Contact recording error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -7054,13 +7855,13 @@ async def compat_stats():
         return _stats_cache["r"]
     cached = _cleaned_leads or []
     total = len(cached)
-    # Score-based counts (80/60/40 thresholds)
-    hot = sum(1 for l in cached if float(l.get("score", 0) or 0) >= 80)
-    warm = sum(1 for l in cached if 60 <= float(l.get("score", 0) or 0) < 80)
-    med = sum(1 for l in cached if 40 <= float(l.get("score", 0) or 0) < 60)
+    # Score-based counts (canonical 80/60/40 thresholds from TEMP_THRESHOLDS)
+    hot = sum(1 for l in cached if safe_float(l.get("score")) >= TEMP_THRESHOLDS["hot"])
+    warm = sum(1 for l in cached if TEMP_THRESHOLDS["warm"] <= safe_float(l.get("score")) < TEMP_THRESHOLDS["hot"])
+    med = sum(1 for l in cached if TEMP_THRESHOLDS["med"] <= safe_float(l.get("score")) < TEMP_THRESHOLDS["warm"])
     cold = total - hot - warm - med
-    total_value = sum(float(l.get("valuation") or 0) for l in cached)
-    avg_score = (sum(l.get("score", 0) for l in cached) / total) if total else 0
+    total_value = sum(safe_float(l.get("valuation")) for l in cached)
+    avg_score = (sum(safe_float(l.get("score")) for l in cached) / total) if total else 0
     cities: Dict[str, int] = defaultdict(int)
     for l in cached:
         cities[l.get("city") or "Unknown"] += 1
@@ -7095,7 +7896,7 @@ def _filter_by_date(cached, range_days):
                 elif dt >= prior_cutoff:
                     prior.append(l)
                 continue
-            except Exception:
+            except (ValueError, TypeError):
                 pass
         current.append(l)
     return current, prior
@@ -7113,12 +7914,12 @@ async def compat_analytics(date_range: int = Query(30, alias="range"), zips: str
 
     # Current period KPIs
     total = len(current)
-    total_value = sum(float(l.get("valuation") or 0) for l in current)
+    total_value = sum(safe_float(l.get("valuation")) for l in current)
     with_contact = sum(1 for l in current if l.get("owner_name") or l.get("owner_phone"))
 
     # Prior period for change %
     prior_total = len(prior) or 1
-    prior_value = sum(float(l.get("valuation") or 0) for l in prior) or 1
+    prior_value = sum(safe_float(l.get("valuation")) for l in prior) or 1
     prior_contact = sum(1 for l in prior if l.get("owner_name") or l.get("owner_phone")) or 1
 
     def pct_change(cur, prev):
@@ -7130,9 +7931,8 @@ async def compat_analytics(date_range: int = Query(30, alias="range"), zips: str
     won_count = 0
     total_pipeline = 0
     try:
-        conn = _conn()
+        conn = _leads_conn()
         cur = conn.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS lead_stages (lead_id INTEGER PRIMARY KEY, stage TEXT, updated_at TEXT)")
         cur.execute("SELECT stage, count(*) FROM lead_stages GROUP BY stage")
         for row in cur.fetchall():
             stage = (row[0] or "").lower()
@@ -7141,8 +7941,8 @@ async def compat_analytics(date_range: int = Query(30, alias="range"), zips: str
             if stage == "won":
                 won_count += cnt
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Failed to query lead_stages for analytics: %s", e)
     close_rate = round((won_count / total_pipeline) * 100) if total_pipeline > 0 else 0
 
     # Build KPIs in frontend-expected format
@@ -7171,7 +7971,7 @@ async def compat_analytics(date_range: int = Query(30, alias="range"), zips: str
     type_values = defaultdict(float)
     for l in current:
         pt = l.get("permit_type") or "Other"
-        type_values[pt] += float(l.get("valuation") or 0)
+        type_values[pt] += safe_float(l.get("valuation"))
     sorted_types = sorted(type_values.items(), key=lambda x: x[1], reverse=True)[:7]
     revenue_by_type = [{"type": t, "value": v} for t, v in sorted_types]
 
@@ -7182,82 +7982,37 @@ async def compat_analytics(date_range: int = Query(30, alias="range"), zips: str
     }
 
 
-@app.get("/api/analytics/neighborhoods")
-async def compat_neighborhoods(zips: str = Query("")):
-    """On Site compat — neighborhood activity by zip code."""
-    cached = DataCache.load(allow_stale=True) or []
-    if zips:
-        zip_set = set(z.strip() for z in zips.split(","))
-        cached = [l for l in cached if str(l.get("zip", "")) in zip_set]
-
-    now = datetime.utcnow()
-    recent_cutoff = now - timedelta(days=15)
-    prior_cutoff = now - timedelta(days=30)
-
-    neighborhoods = {}
-    for l in cached:
-        z = str(l.get("zip", ""))[:5]
-        if not z:
-            continue
-        if z not in neighborhoods:
-            neighborhoods[z] = {
-                "zip": z,
-                "city": l.get("city") or "",
-                "state": _infer_state(l.get("city") or ""),
-                "permits": 0,
-                "value": 0.0,
-                "recent": 0,
-                "prior": 0,
-            }
-        neighborhoods[z]["permits"] += 1
-        neighborhoods[z]["value"] += float(l.get("valuation") or 0)
-        d = l.get("issue_date")
-        if d:
-            try:
-                dt = datetime.fromisoformat(d)
-                if dt >= recent_cutoff:
-                    neighborhoods[z]["recent"] += 1
-                elif dt >= prior_cutoff:
-                    neighborhoods[z]["prior"] += 1
-            except Exception:
-                pass
-
-    result = []
-    for n in neighborhoods.values():
-        prior_val = n.pop("prior") or 1
-        recent_val = n.pop("recent")
-        n["trend_pct"] = round(((recent_val - prior_val) / prior_val) * 100) if prior_val else 0
-        result.append(n)
-    result.sort(key=lambda x: x["permits"], reverse=True)
-    return result[:30]
+# NOTE: Duplicate /api/analytics/neighborhoods route removed (was dead code — FastAPI
+# uses the first registration at line ~6024). The richer trend-based logic from this
+# duplicate has been preserved in a comment for potential future use.
+# See git history for the full compat_neighborhoods() implementation.
 
 
 @app.get("/api/analytics/funnel")
 async def compat_funnel(zips: str = Query("")):
     """On Site compat — conversion funnel with values."""
-    cached = DataCache.load(allow_stale=True) or []
+    cached = _cleaned_leads or DataCache.load(allow_stale=True) or []
     if zips:
         zip_set = set(z.strip() for z in zips.split(","))
         cached = [l for l in cached if str(l.get("zip", "")) in zip_set]
 
     total = len(cached)
-    total_value = sum(float(l.get("valuation") or 0) for l in cached)
-    hot_leads = [l for l in cached if str(l.get("temperature", "")).lower() == "hot"]
+    total_value = sum(safe_float(l.get("valuation")) for l in cached)
+    hot_leads = [l for l in cached if safe_float(l.get("score")) >= TEMP_THRESHOLDS["hot"]]
     hot_count = len(hot_leads)
-    hot_value = sum(float(l.get("valuation") or 0) for l in hot_leads)
+    hot_value = sum(safe_float(l.get("valuation")) for l in hot_leads)
     contact_leads = [l for l in cached if l.get("owner_name") or l.get("owner_phone")]
     contact_count = len(contact_leads)
-    contact_value = sum(float(l.get("valuation") or 0) for l in contact_leads)
+    contact_value = sum(safe_float(l.get("valuation")) for l in contact_leads)
 
     # Read pipeline stages + compute value per stage
     stage_data = {"contacted": {"count": 0, "value": 0}, "quoted": {"count": 0, "value": 0}, "won": {"count": 0, "value": 0}}
     try:
-        conn = _conn()
+        conn = _leads_conn()
         cur = conn.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS lead_stages (lead_id INTEGER PRIMARY KEY, stage TEXT, updated_at TEXT)")
         cur.execute("SELECT lead_id, stage FROM lead_stages")
         # Build a quick ID→valuation lookup
-        val_map = {int(l.get("id", -1)): float(l.get("valuation") or 0) for l in cached}
+        val_map = {int(l.get("id", -1)): safe_float(l.get("valuation")) for l in cached}
         for row in cur.fetchall():
             lid, stage = row[0], (row[1] or "").lower()
             v = val_map.get(lid, 0)
@@ -7271,8 +8026,8 @@ async def compat_funnel(zips: str = Query("")):
                 stage_data["won"]["count"] += 1
                 stage_data["won"]["value"] += v
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Failed to query lead_stages for funnel: %s", e)
 
     return [
         {"stage": "New Leads", "count": total, "value": total_value},
@@ -7301,7 +8056,7 @@ async def compat_territories(state: Optional[str] = Query(None), city: Optional[
         if z not in zips:
             zips[z] = {"zip": z, "city": l.get("city", ""), "count": 0, "hot": 0, "total_value": 0}
         zips[z]["count"] += 1
-        zips[z]["total_value"] += float(l.get("valuation") or 0)
+        zips[z]["total_value"] += safe_float(l.get("valuation"))
         if str(l.get("temperature", "")).lower() == "hot":
             zips[z]["hot"] += 1
     result = sorted(zips.values(), key=lambda x: x["count"], reverse=True)
@@ -7312,7 +8067,7 @@ async def compat_territories(state: Optional[str] = Query(None), city: Optional[
 async def compat_alerts():
     """On Site compat — recent hot lead alerts."""
     cached = DataCache.load(allow_stale=True) or []
-    hot_leads = [l for l in cached if str(l.get("temperature", "")).lower() == "hot"]
+    hot_leads = [l for l in cached if safe_float(l.get("score")) >= TEMP_THRESHOLDS["hot"]]
     hot_leads.sort(key=lambda l: l.get("issue_date", ""), reverse=True)
     alerts = []
     for l in hot_leads[:20]:
@@ -7354,8 +8109,8 @@ async def compat_geocode(q: str = Query(...)):
                     data = await resp.json()
                     if data:
                         return {"lat": float(data[0]["lat"]), "lng": float(data[0]["lon"]), "address": data[0].get("display_name")}
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Nominatim geocoding failed: %s", e)
     raise HTTPException(status_code=404, detail="Could not geocode address")
 
 
@@ -7407,8 +8162,8 @@ async def compat_zimas(lat: float = Query(...), lng: float = Query(...)):
                             "lotSize": None,
                             "zoning": attr.get("UseType", ""),
                         }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("ZIMAS/ArcGIS parcel query failed: %s", e)
     return {"apn": "", "address": "", "lotSize": None, "zoning": None}
 
 
@@ -7446,8 +8201,8 @@ async def compat_parcels(bbox: str = Query(...), limit: int = Query(1200)):
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
                     return await resp.json()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("ArcGIS parcel query failed: %s", e)
     return {"type": "FeatureCollection", "features": []}
 
 
@@ -7489,8 +8244,8 @@ async def compat_enrichment_run():
                     l["owner_name"] = owner["owner_name"]
                     l["mailing_address"] = owner.get("mailing_address", "")
                     enriched_count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("LA owner enrichment failed for APN %s: %s", apn, e)
     after = sum(1 for l in cached if l.get("owner_name") or l.get("owner_phone"))
     return {"enriched": after - before, "total": len(cached)}
 
@@ -7562,7 +8317,14 @@ async def enrich_lead_free(lead_id: str):
 
         # Save updated cache
         if result.get('email') or result.get('phone'):
-            DataCache.save(cached)
+            all_cached = DataCache.load(allow_stale=True)
+            if all_cached:
+                # Update the lead in the full cache
+                for i, c in enumerate(all_cached):
+                    if str(c.get("id")) == str(lead_id):
+                        all_cached[i] = {**c, **{k: lead[k] for k in ('owner_email', 'email_verified', 'email_confidence', 'owner_phone', 'phone_verified', 'phone_confidence') if k in lead}}
+                        break
+                DataCache.save(all_cached)
 
         return {
             "success": result.get('success', False),
@@ -7636,8 +8398,8 @@ async def crm_connections():
             if p["provider"] in db_conns:
                 p["status"] = db_conns[p["provider"]]["status"]
                 p["connected_at"] = db_conns[p["provider"]]["connected_at"]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Failed to load CRM connections from db: %s", e)
     return providers
 
 
@@ -7672,8 +8434,8 @@ async def crm_disconnect(provider: str):
         cur.execute("DELETE FROM crm_connections WHERE provider=?", (provider,))
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Failed to disconnect CRM provider %s: %s", provider, e)
     return {"status": "disconnected", "provider": provider}
 
 
@@ -7683,6 +8445,30 @@ async def crm_push_lead(provider: str, payload: dict):
     lead_id = payload.get("lead_id")
     logger.info(f"CRM push: {provider} lead_id={lead_id}")
     return {"status": "ok", "provider": provider, "lead_id": lead_id, "message": "Lead queued for CRM sync"}
+
+
+@app.post("/api/crm/test/{provider}")
+async def crm_test_connection(provider: str, request: Request):
+    """Test if a CRM integration is configured and reachable."""
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    try:
+        jwt.decode(token, SECRET, algorithms=["HS256"])
+    except Exception:
+        raise HTTPException(401, "Unauthorized")
+    # Check if provider has stored credentials
+    try:
+        conn = _conn()
+        conn.execute("""CREATE TABLE IF NOT EXISTS crm_connections
+                       (provider TEXT PRIMARY KEY, api_key TEXT, status TEXT, connected_at TEXT)""")
+        row = conn.execute(
+            "SELECT status FROM crm_connections WHERE provider = ? LIMIT 1", (provider,)
+        ).fetchone()
+        conn.close()
+    except Exception:
+        row = None
+    if row and row[0] == "connected":
+        return {"connected": True, "provider": provider, "message": f"{provider} credentials found"}
+    return {"connected": False, "provider": provider, "message": f"No {provider} credentials stored"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -8131,6 +8917,608 @@ async def get_bulk_collection_stats():
         "success": True,
         "stats": bulk_collector.get_stats()
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AI CHAT — Real LLM endpoint (Claude or OpenAI)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/chat")
+async def api_chat(request: Request):
+    """AI chat endpoint using Claude API (falls back to pattern matching)."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    body = await request.json()
+    message = body.get("message", "").strip()
+    context = body.get("context", {})
+    if not message:
+        raise HTTPException(status_code=400, detail="Message required")
+
+    # Try Claude API first
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if api_key:
+        try:
+            async with aiohttp.ClientSession() as session:
+                system_prompt = (
+                    "You are the Onsite AI assistant — a sales copilot for construction contractors. "
+                    "You help users understand their permit leads, draft outreach messages, analyze pipeline, "
+                    "and provide market intelligence. Be concise, actionable, and professional. "
+                    "When drafting outreach, personalize with the lead's address, permit type, project value, and owner name. "
+                    f"User context: {json.dumps(context)}"
+                )
+                payload = {
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1024,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": message}]
+                }
+                headers = {
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                }
+                async with session.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        reply = data.get("content", [{}])[0].get("text", "")
+                        return {"reply": reply, "source": "ai"}
+                    else:
+                        logger.warning("Claude API error %d", resp.status)
+        except Exception as e:
+            logger.warning("Claude API failed: %s", e)
+
+    # Try OpenAI as fallback
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    if openai_key:
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {"role": "system", "content": f"You are the Onsite AI sales copilot for construction contractors. Context: {json.dumps(context)}"},
+                        {"role": "user", "content": message}
+                    ],
+                    "max_tokens": 1024
+                }
+                headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+                async with session.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        reply = data["choices"][0]["message"]["content"]
+                        return {"reply": reply, "source": "ai"}
+        except Exception as e:
+            logger.warning("OpenAI API failed: %s", e)
+
+    # No AI key configured — return indicator for client to use local patterns
+    return {"reply": "", "source": "local", "note": "No AI API key configured. Using local pattern matching."}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEAM MANAGEMENT — Invite, list, update, remove team members
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _ensure_team_tables():
+    """Create team tables if they don't exist."""
+    conn = _leads_conn()
+    conn.execute("""CREATE TABLE IF NOT EXISTS team_members (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        email TEXT NOT NULL,
+        name TEXT DEFAULT '',
+        role TEXT DEFAULT 'viewer',
+        status TEXT DEFAULT 'invited',
+        invited_at TEXT DEFAULT (datetime('now')),
+        accepted_at TEXT,
+        UNIQUE(owner_id, email)
+    )""")
+    conn.commit()
+    conn.close()
+
+@app.get("/api/team")
+async def get_team(request: Request):
+    """Get team members for current user."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        parts = token.split(".")
+        pad = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+        user_id = payload.get("sub", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    _ensure_team_tables()
+    conn = _leads_conn()
+    import sqlite3
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM team_members WHERE owner_id = ? ORDER BY invited_at DESC", (user_id,)).fetchall()
+    conn.close()
+    return {"members": [dict(r) for r in rows]}
+
+
+@app.post("/api/team/invite")
+async def invite_team_member(request: Request):
+    """Invite a team member by email."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        parts = token.split(".")
+        pad = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+        user_id = payload.get("sub", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    body = await request.json()
+    email = body.get("email", "").strip().lower()
+    name = body.get("name", "").strip()
+    role = body.get("role", "viewer")
+
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email required")
+    if role not in ("admin", "manager", "viewer", "finance"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    _ensure_team_tables()
+    member_id = str(uuid.uuid4())
+    conn = _leads_conn()
+    try:
+        conn.execute(
+            "INSERT INTO team_members (id, owner_id, email, name, role) VALUES (?, ?, ?, ?, ?)",
+            (member_id, user_id, email, name, role)
+        )
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        if "UNIQUE" in str(e):
+            raise HTTPException(status_code=409, detail="Member already invited")
+        raise HTTPException(status_code=500, detail="Failed to invite member")
+    conn.close()
+
+    # Send invitation email if SendGrid is configured
+    sg_key = os.getenv("SENDGRID_API_KEY", "")
+    if sg_key:
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post("https://api.sendgrid.com/v3/mail/send", json={
+                    "personalizations": [{"to": [{"email": email}]}],
+                    "from": {"email": "noreply@onsite.com", "name": "Onsite"},
+                    "subject": f"You've been invited to join Onsite",
+                    "content": [{"type": "text/plain", "value": f"Hi {name or 'there'},\n\nYou've been invited to join an Onsite team as {role}. Sign up at {os.getenv('APP_URL', 'http://localhost:18000')} to get started."}]
+                }, headers={"Authorization": f"Bearer {sg_key}", "Content-Type": "application/json"})
+        except Exception as e:
+            logger.warning("Invite email failed: %s", e)
+
+    return {"id": member_id, "email": email, "role": role, "status": "invited"}
+
+
+@app.put("/api/team/{member_id}")
+async def update_team_member(member_id: str, request: Request):
+    """Update a team member's role."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    body = await request.json()
+    role = body.get("role", "")
+    if role and role not in ("admin", "manager", "viewer", "finance"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    conn = _leads_conn()
+    if role:
+        conn.execute("UPDATE team_members SET role = ? WHERE id = ?", (role, member_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+
+@app.delete("/api/team/{member_id}")
+async def remove_team_member(member_id: str, request: Request):
+    """Remove a team member."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    conn = _leads_conn()
+    conn.execute("DELETE FROM team_members WHERE id = ?", (member_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DEVELOPER API KEYS — Generate, list, revoke
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _ensure_apikey_tables():
+    """Create API key tables."""
+    conn = _leads_conn()
+    conn.execute("""CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT DEFAULT 'Default Key',
+        key_prefix TEXT NOT NULL,
+        key_hash TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        last_used_at TEXT,
+        is_active INTEGER DEFAULT 1
+    )""")
+    conn.commit()
+    conn.close()
+
+@app.get("/api/developer/keys")
+async def list_api_keys(request: Request):
+    """List user's API keys (shows only prefix, not full key)."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        parts = token.split(".")
+        pad = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+        user_id = payload.get("sub", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    _ensure_apikey_tables()
+    conn = _leads_conn()
+    import sqlite3
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, name, key_prefix, created_at, last_used_at, is_active FROM api_keys WHERE user_id = ? ORDER BY created_at DESC",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+    return {"keys": [dict(r) for r in rows]}
+
+
+@app.post("/api/developer/keys")
+async def create_api_key(request: Request):
+    """Generate a new API key. Returns the full key ONCE."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        parts = token.split(".")
+        pad = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+        user_id = payload.get("sub", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    body = await request.json()
+    name = body.get("name", "Default Key").strip()[:64]
+
+    import hashlib
+    import secrets
+    key_id = str(uuid.uuid4())
+    raw_key = f"onsite_{secrets.token_hex(24)}"
+    key_prefix = raw_key[:12] + "..."
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+
+    _ensure_apikey_tables()
+    conn = _leads_conn()
+    conn.execute(
+        "INSERT INTO api_keys (id, user_id, name, key_prefix, key_hash) VALUES (?, ?, ?, ?, ?)",
+        (key_id, user_id, name, key_prefix, key_hash)
+    )
+    conn.commit()
+    conn.close()
+
+    return {"id": key_id, "key": raw_key, "prefix": key_prefix, "name": name, "note": "Save this key now — it won't be shown again."}
+
+
+@app.delete("/api/developer/keys/{key_id}")
+async def revoke_api_key(key_id: str, request: Request):
+    """Revoke (deactivate) an API key."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    conn = _leads_conn()
+    conn.execute("UPDATE api_keys SET is_active = 0 WHERE id = ?", (key_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DATA COLLECTION — Trigger & monitor collection pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/admin/run-collection")
+async def admin_run_collection(request: Request, step: str = "all"):
+    """Trigger data collection pipeline manually."""
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    payload = decode_jwt_token(token)
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
+
+    import asyncio as _aio
+
+    async def _run():
+        try:
+            from data_sources.run_collection import (
+                step_catalog, step_fema, step_census,
+                step_hpi, step_sales, step_zip_risk,
+            )
+            if step in ("all", "catalog"):
+                await _aio.to_thread(step_catalog)
+            if step in ("all", "fema"):
+                await _aio.to_thread(step_fema)
+            if step in ("all", "census"):
+                await _aio.to_thread(step_census)
+            if step in ("all", "hpi"):
+                await _aio.to_thread(step_hpi)
+            if step in ("all", "sales"):
+                await _aio.to_thread(step_sales)
+            if step in ("all", "zip"):
+                await _aio.to_thread(step_zip_risk)
+        except Exception as e:
+            logger.error("Data collection error: %s", e)
+
+    asyncio.create_task(_run())
+    return {"status": "started", "step": step}
+
+
+@app.get("/api/admin/collection-status")
+async def admin_collection_status(request: Request):
+    """Show data collection stats from sync log."""
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "")
+    payload = decode_jwt_token(token)
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
+
+    try:
+        from data_sources.schema import get_db as get_ds_db
+        with get_ds_db() as conn:
+            recent = conn.execute("""
+                SELECT source_name, records_fetched, records_new,
+                       duration_seconds, status, started_at
+                FROM data_sync_log ORDER BY started_at DESC LIMIT 20
+            """).fetchall()
+            return {"runs": [dict(r) for r in recent]}
+    except Exception as e:
+        return {"runs": [], "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DATABASE BACKUP — Create/download/list backups
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/admin/backup")
+async def create_backup(request: Request):
+    """Create a database backup (admin only)."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        parts = token.split(".")
+        pad = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+        role = payload.get("role", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    import shutil
+    from models.database import _db_path
+    db_path = _db_path()
+    backup_dir = os.path.join(os.path.dirname(db_path), "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(backup_dir, f"leads_{timestamp}.db")
+
+    # Use SQLite backup API for consistency
+    import sqlite3
+    src = sqlite3.connect(db_path)
+    dst = sqlite3.connect(backup_path)
+    src.backup(dst)
+    src.close()
+    dst.close()
+
+    size_mb = round(os.path.getsize(backup_path) / 1048576, 1)
+    return {"status": "ok", "path": backup_path, "size_mb": size_mb, "timestamp": timestamp}
+
+
+@app.get("/api/admin/backups")
+async def list_backups(request: Request):
+    """List available database backups."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    from models.database import _db_path as _dbp
+    backup_dir = os.path.join(os.path.dirname(_dbp()), "backups")
+    if not os.path.exists(backup_dir):
+        return {"backups": []}
+
+    backups = []
+    for f in sorted(os.listdir(backup_dir), reverse=True):
+        if f.endswith(".db"):
+            fp = os.path.join(backup_dir, f)
+            backups.append({
+                "name": f,
+                "size_mb": round(os.path.getsize(fp) / 1048576, 1),
+                "created": datetime.fromtimestamp(os.path.getmtime(fp)).isoformat()
+            })
+    return {"backups": backups[:20]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BATCH GEOCODING — Geocode leads missing lat/lng
+# ═══════════════════════════════════════════════════════════════════════════
+
+_geocode_running = False
+
+@app.post("/api/admin/geocode-batch")
+async def start_batch_geocode(request: Request, background_tasks: BackgroundTasks):
+    """Start batch geocoding for leads without coordinates (admin only)."""
+    global _geocode_running
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        parts = token.split(".")
+        pad = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+        role = payload.get("role", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    if _geocode_running:
+        return {"status": "already_running"}
+
+    body = await request.json()
+    batch_limit = min(body.get("limit", 500), 5000)
+
+    async def _run_geocode(limit):
+        global _geocode_running
+        _geocode_running = True
+        geocoded_count = 0
+        failed_count = 0
+        try:
+            conn = _leads_conn()
+            rows = conn.execute(
+                "SELECT id, address, city, state FROM leads WHERE (lat IS NULL OR lat = 0) AND address != '' LIMIT ?",
+                (limit,)
+            ).fetchall()
+            conn.close()
+
+            gc = GeocodingClient()
+            for row in rows:
+                try:
+                    result = await gc.geocode(row[1], row[2], row[3] or "CA")
+                    if result and result.get("lat"):
+                        conn2 = _leads_conn()
+                        conn2.execute(
+                            "UPDATE leads SET lat = ?, lng = ? WHERE id = ?",
+                            (result["lat"], result["lng"], row[0])
+                        )
+                        conn2.commit()
+                        conn2.close()
+                        geocoded_count += 1
+                    else:
+                        failed_count += 1
+                except Exception:
+                    failed_count += 1
+                await asyncio.sleep(1.1)  # Nominatim rate limit
+        except Exception as e:
+            logger.error("Batch geocode error: %s", e)
+        finally:
+            _geocode_running = False
+            logger.info("Batch geocode complete: %d geocoded, %d failed", geocoded_count, failed_count)
+
+    background_tasks.add_task(_run_geocode, batch_limit)
+    return {"status": "started", "batch_size": batch_limit}
+
+
+@app.get("/api/admin/geocode-status")
+async def geocode_status():
+    """Check batch geocoding status."""
+    try:
+        conn = _leads_conn()
+        total = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+        geocoded = conn.execute("SELECT COUNT(*) FROM leads WHERE lat IS NOT NULL AND lat != 0").fetchone()[0]
+        conn.close()
+    except Exception as e:
+        logger.error("Geocode status error: %s", e)
+        return {"running": _geocode_running, "total_leads": 0, "geocoded": 0, "missing": 0, "coverage_pct": 0, "error": str(e)}
+    return {
+        "running": _geocode_running,
+        "total_leads": total,
+        "geocoded": geocoded,
+        "missing": total - geocoded,
+        "coverage_pct": round(geocoded / max(1, total) * 100, 1)
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BILLING — Wire up Plan & Billing to Stripe
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/billing/portal")
+async def create_billing_portal(request: Request):
+    """Create Stripe customer portal session for managing subscription."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    stripe_key = os.getenv("STRIPE_SECRET_KEY", "")
+    if not stripe_key:
+        return {"error": "Stripe not configured", "url": None}
+
+    try:
+        parts = token.split(".")
+        pad = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+        user_email = payload.get("email", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        import stripe
+        stripe.api_key = stripe_key
+        customers = stripe.Customer.list(email=user_email, limit=1)
+        if not customers.data:
+            return {"error": "No billing account found", "url": None}
+
+        session = stripe.billing_portal.Session.create(
+            customer=customers.data[0].id,
+            return_url=os.getenv("APP_URL", "http://localhost:18000")
+        )
+        return {"url": session.url}
+    except Exception as e:
+        logger.error("Stripe portal error: %s", e)
+        return {"error": str(e), "url": None}
+
+
+@app.get("/api/billing/invoices")
+async def list_invoices(request: Request):
+    """List user's Stripe invoices."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    stripe_key = os.getenv("STRIPE_SECRET_KEY", "")
+    if not stripe_key:
+        return {"invoices": [], "note": "Stripe not configured"}
+
+    try:
+        parts = token.split(".")
+        pad = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+        user_email = payload.get("email", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        import stripe
+        stripe.api_key = stripe_key
+        customers = stripe.Customer.list(email=user_email, limit=1)
+        if not customers.data:
+            return {"invoices": []}
+
+        invoices = stripe.Invoice.list(customer=customers.data[0].id, limit=12)
+        return {"invoices": [{
+            "id": inv.id,
+            "amount": inv.amount_due / 100,
+            "status": inv.status,
+            "date": datetime.fromtimestamp(inv.created).isoformat(),
+            "pdf": inv.invoice_pdf
+        } for inv in invoices.data]}
+    except Exception as e:
+        logger.error("Stripe invoices error: %s", e)
+        return {"invoices": [], "error": str(e)}
 
 
 # ---------------------------------------------------------------------------

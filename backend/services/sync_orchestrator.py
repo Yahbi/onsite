@@ -10,21 +10,21 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
-from backend.models.database import bulk_upsert_leads, log_sync
-from backend.models.source_registry import (
+from models.database import bulk_upsert_leads, log_sync
+from models.source_registry import (
     get_sources_batch,
     get_sources_by_tier,
     update_source_status,
 )
-from backend.services.fetchers.arcgis_fetcher import (
+from services.fetchers.arcgis_fetcher import (
     fetch_arcgis,
     normalize_arcgis_record,
 )
-from backend.services.fetchers.ckan_fetcher import (
+from services.fetchers.ckan_fetcher import (
     fetch_ckan,
     normalize_ckan_record,
 )
-from backend.services.fetchers.socrata_fetcher import (
+from services.fetchers.socrata_fetcher import (
     fetch_socrata,
     normalize_socrata_record,
 )

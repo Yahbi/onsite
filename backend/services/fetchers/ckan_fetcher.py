@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from backend.services.fetchers.field_mapper import (
+from services.fetchers.field_mapper import (
     clean_valuation,
     map_record,
     parse_date,
