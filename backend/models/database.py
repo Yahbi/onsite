@@ -26,9 +26,11 @@ def _db_path():
 @contextmanager
 def get_db():
     """Context manager for database connections with WAL mode."""
-    conn = sqlite3.connect(_db_path(), timeout=10)
+    conn = sqlite3.connect(_db_path(), timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA cache_size=-64000")  # 64MB page cache
+    conn.execute("PRAGMA mmap_size=268435456")  # 256MB memory-mapped I/O
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -61,7 +63,7 @@ def init_db():
                 issue_date TEXT DEFAULT '',
                 days_old INTEGER DEFAULT 0,
                 score INTEGER DEFAULT 0,
-                temperature TEXT DEFAULT 'Cold',
+                temperature TEXT DEFAULT 'cold',
                 source TEXT DEFAULT '',
                 contractor_name TEXT DEFAULT '',
                 contractor_phone TEXT DEFAULT '',
@@ -114,6 +116,13 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_leads_state ON leads(state);
             CREATE INDEX IF NOT EXISTS idx_leads_owner ON leads(owner_name);
             CREATE INDEX IF NOT EXISTS idx_leads_active ON leads(is_active);
+            CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_leads_owner_phone ON leads(owner_phone);
+            CREATE INDEX IF NOT EXISTS idx_leads_owner_email ON leads(owner_email);
+            CREATE INDEX IF NOT EXISTS idx_leads_city_score ON leads(city, score DESC);
+            CREATE INDEX IF NOT EXISTS idx_leads_active_temp ON leads(is_active, temperature);
+            CREATE INDEX IF NOT EXISTS idx_leads_active_score ON leads(is_active, score DESC);
+            CREATE INDEX IF NOT EXISTS idx_leads_bbox ON leads(is_active, lat, lng);
 
             -- Saved filters
             CREATE TABLE IF NOT EXISTS saved_filters (
@@ -160,17 +169,6 @@ def init_db():
                 timestamp TEXT DEFAULT (datetime('now'))
             );
 
-            -- WebSocket notification queue
-            CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT NOT NULL,  -- new_lead, hot_lead, stage_change
-                lead_id INTEGER,
-                message TEXT NOT NULL,
-                data TEXT DEFAULT '{}',  -- JSON payload
-                read INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-
             -- API source registry (4,000+ construction data APIs)
             CREATE TABLE IF NOT EXISTS api_sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,8 +202,69 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_sources_type ON api_sources(source_type);
             CREATE INDEX IF NOT EXISTS idx_sources_state ON api_sources(state);
             CREATE INDEX IF NOT EXISTS idx_sources_url ON api_sources(api_url);
+
         """)
+
+        # Add extended columns to api_sources (idempotent ALTER TABLE)
+        _new_cols = [
+            ("date_field", "TEXT DEFAULT ''"),
+            ("lookback_days", "INTEGER DEFAULT 60"),
+            ("field_mappings", "TEXT DEFAULT '{}'"),
+            ("auth_type", "TEXT DEFAULT 'none'"),
+            ("rate_limit", "TEXT DEFAULT ''"),
+            ("verified", "INTEGER DEFAULT 0"),
+            ("source_file", "TEXT DEFAULT ''"),
+            ("sample_fields", "TEXT DEFAULT ''"),
+            ("record_count", "INTEGER DEFAULT 0"),
+        ]
+        for col_name, col_def in _new_cols:
+            try:
+                conn.execute(f"ALTER TABLE api_sources ADD COLUMN {col_name} {col_def}")
+            except Exception:
+                pass  # Column already exists
+
         logger.info("Database initialized successfully")
+
+
+def query_leads_for_map(limit: int = 50000) -> List[list]:
+    """Lightweight query returning only map-essential fields.
+    Returns list of [id, lat, lng, pri_int, score, city] arrays.
+    pri_int: 0=hot, 1=warm, 2=med, 3=cold
+    Capped at `limit` rows, ordered by score DESC to show best leads first.
+    """
+    _PRI_MAP = {"hot": 0, "warm": 1, "med": 2, "cold": 3}
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT id, lat, lng, temperature, score, city
+               FROM leads
+               WHERE is_active = 1
+                 AND lat != 0 AND lng != 0
+                 AND lat IS NOT NULL AND lng IS NOT NULL
+                 AND (issue_date = '' OR issue_date >= date('now', '-' || ? || ' days'))
+               ORDER BY score DESC
+               LIMIT ?""",
+            (os.getenv("LEAD_VISIBILITY_DAYS", "60"), limit)
+        ).fetchall()
+        points = []
+        for row in rows:
+            try:
+                lat_f = float(row["lat"])
+                lng_f = float(row["lng"])
+            except (ValueError, TypeError):
+                continue
+            if lat_f == 0.0 and lng_f == 0.0:
+                continue
+            temp = str(row["temperature"] or "med").lower()
+            pri_int = _PRI_MAP.get(temp, 2)
+            points.append([
+                str(row["id"]),
+                lat_f,
+                lng_f,
+                pri_int,
+                int(row["score"] or 50),
+                str(row["city"] or ""),
+            ])
+        return points
 
 
 def normalize_address(address: str, city: str) -> str:
@@ -255,7 +314,7 @@ def upsert_lead(lead: dict, conn=None) -> Tuple[int, bool]:
             # Only update fields that are better in the new data
             if lead.get("score", 0) > (existing["score"] or 0):
                 updates["score"] = lead["score"]
-                updates["temperature"] = lead.get("temperature", "Cold")
+                updates["temperature"] = lead.get("temperature", "cold")
                 updates["days_old"] = lead.get("days_old", 0)
             # Fill empty owner fields
             if lead.get("owner_name") and not existing["owner_name"]:
@@ -363,6 +422,12 @@ def query_leads(
     conditions = ["is_active = 1"]
     params = []
 
+    # Auto-hide leads older than LEAD_VISIBILITY_DAYS
+    visibility_days = int(os.getenv("LEAD_VISIBILITY_DAYS", "60"))
+    if visibility_days > 0:
+        conditions.append("(issue_date = '' OR issue_date >= date('now', '-' || ? || ' days'))")
+        params.append(str(visibility_days))
+
     if city:
         conditions.append("city LIKE ?")
         params.append(f"%{city}%")
@@ -422,9 +487,18 @@ def query_leads(
         ).fetchone()
         total = count_row["cnt"] if count_row else 0
 
-        # Get paginated results
+        # Get paginated results — select only UI-essential columns
+        _LEAD_COLS = (
+            "id, permit_number, address, city, state, zip, lat, lng, "
+            "work_description, permit_type, valuation, issue_date, days_old, "
+            "score, temperature, source, contractor_name, contractor_phone, "
+            "owner_name, owner_phone, owner_email, owner_address, apn, "
+            "permit_url, stage, enrichment_status, notes, tags, "
+            "market_value, year_built, square_feet, zoning, "
+            "readiness_score, competition_level, created_at, updated_at, is_active"
+        )
         rows = conn.execute(
-            f"SELECT * FROM leads WHERE {where_clause} ORDER BY {sort_by} {sort_dir} LIMIT ? OFFSET ?",
+            f"SELECT {_LEAD_COLS} FROM leads WHERE {where_clause} ORDER BY {sort_by} {sort_dir} LIMIT ? OFFSET ?",
             params + [limit, offset]
         ).fetchall()
 
@@ -451,33 +525,50 @@ def update_lead(lead_id: int, updates: dict) -> bool:
 
 
 def get_stats() -> dict:
-    """Get aggregate lead statistics."""
+    """Get aggregate lead statistics in a single efficient query."""
     with get_db() as conn:
-        total = conn.execute("SELECT COUNT(*) as cnt FROM leads WHERE is_active = 1").fetchone()["cnt"]
-        hot = conn.execute("SELECT COUNT(*) as cnt FROM leads WHERE temperature = 'Hot' AND is_active = 1").fetchone()["cnt"]
-        warm = conn.execute("SELECT COUNT(*) as cnt FROM leads WHERE temperature = 'Warm' AND is_active = 1").fetchone()["cnt"]
-        cold = conn.execute("SELECT COUNT(*) as cnt FROM leads WHERE temperature = 'Cold' AND is_active = 1").fetchone()["cnt"]
-        total_value = conn.execute("SELECT COALESCE(SUM(valuation), 0) as val FROM leads WHERE is_active = 1").fetchone()["val"]
-        avg_score = conn.execute("SELECT COALESCE(AVG(score), 0) as avg FROM leads WHERE is_active = 1").fetchone()["avg"]
+        # Single query replaces 7 separate COUNT queries
+        agg = conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN temperature = 'hot' THEN 1 ELSE 0 END) as hot,
+                SUM(CASE WHEN temperature = 'warm' THEN 1 ELSE 0 END) as warm,
+                SUM(CASE WHEN temperature = 'cold' THEN 1 ELSE 0 END) as cold,
+                COALESCE(SUM(valuation), 0) as total_value,
+                COALESCE(AVG(score), 0) as avg_score,
+                SUM(CASE WHEN enrichment_status = 'enriched' THEN 1 ELSE 0 END) as enriched,
+                SUM(CASE WHEN enrichment_status = 'pending' THEN 1 ELSE 0 END) as pending
+            FROM leads WHERE is_active = 1
+        """).fetchone()
+
+        total = agg["total"]
+        hot = agg["hot"]
+        warm = agg["warm"]
+        cold = agg["cold"]
+        total_value = agg["total_value"]
+        avg_score = agg["avg_score"]
+        enriched = agg["enriched"]
+        pending_count = agg["pending"]
 
         # City breakdown
         cities_rows = conn.execute(
-            "SELECT city, COUNT(*) as cnt FROM leads WHERE is_active = 1 GROUP BY city ORDER BY cnt DESC"
+            "SELECT city, COUNT(*) as cnt FROM leads "
+            "WHERE is_active = 1 AND city IS NOT NULL AND city != '' "
+            "GROUP BY city ORDER BY cnt DESC LIMIT 100"
         ).fetchall()
         cities = {row["city"]: row["cnt"] for row in cities_rows}
 
-        # Source count
+        # Source counts
         sources = conn.execute(
             "SELECT COUNT(DISTINCT source) as cnt FROM leads WHERE is_active = 1"
         ).fetchone()["cnt"]
 
-        # Enrichment stats
-        enriched = conn.execute(
-            "SELECT COUNT(*) as cnt FROM leads WHERE enrichment_status = 'enriched' AND is_active = 1"
-        ).fetchone()["cnt"]
-        pending = conn.execute(
-            "SELECT COUNT(*) as cnt FROM leads WHERE enrichment_status = 'pending' AND is_active = 1"
-        ).fetchone()["cnt"]
+        try:
+            sources_active = conn.execute(
+                "SELECT COUNT(*) as cnt FROM api_sources WHERE status = 'active'"
+            ).fetchone()["cnt"]
+        except Exception:
+            sources_active = sources
 
         return {
             "total_leads": total,
@@ -488,23 +579,32 @@ def get_stats() -> dict:
             "avg_score": round(avg_score, 1),
             "cities": cities,
             "sources": sources,
+            "sources_active": sources_active,
             "enrichment": {
                 "enriched": enriched,
-                "pending": pending,
+                "pending": pending_count,
                 "rate": round(enriched / max(total, 1) * 100, 1)
             }
         }
 
 
 def get_leads_needing_enrichment(limit: int = 50) -> List[dict]:
-    """Get leads that need enrichment, prioritized by score and value."""
+    """Get leads that need enrichment, prioritized by owner_name availability.
+
+    Strategy: leads WITH owner_name are enriched first (phone/email lookup works).
+    Leads without owner_name go through Regrid first to get the name.
+    Within each group, sorted by score then valuation.
+    """
     with get_db() as conn:
         rows = conn.execute(
-            """SELECT * FROM leads 
-               WHERE enrichment_status = 'pending' 
+            """SELECT * FROM leads
+               WHERE enrichment_status = 'pending'
                  AND is_active = 1
                  AND (owner_phone = '' OR owner_email = '')
-               ORDER BY score DESC, valuation DESC
+               ORDER BY
+                 CASE WHEN owner_name != '' AND owner_name != 'Pending lookup'
+                      THEN 0 ELSE 1 END,
+                 score DESC, valuation DESC
                LIMIT ?""",
             (limit,)
         ).fetchall()
@@ -512,8 +612,74 @@ def get_leads_needing_enrichment(limit: int = 50) -> List[dict]:
 
 
 def mark_enriched(lead_id: int, data: dict):
-    """Mark a lead as enriched with the given data."""
-    updates = {k: v for k, v in data.items() if v}
+    """Mark a lead as enriched with the given data.
+
+    Accepts both raw API field names (name, phone, email, address)
+    and DB column names (owner_name, owner_phone, owner_email, owner_address).
+    Also persists Regrid property data (market_value, year_built, etc.)
+    when present in data["regrid_data"].
+    """
+    # Map common API response keys to DB column names
+    field_map = {
+        "name": "owner_name",
+        "phone": "owner_phone",
+        "email": "owner_email",
+        "address": "owner_address",
+        "mailing_address": "owner_address",
+    }
+    # Only allow known lead table columns
+    allowed_cols = {
+        "owner_name", "owner_phone", "owner_email", "owner_address",
+        "alt_phones", "alt_emails",
+        "apn", "market_value", "year_built", "square_feet", "lot_size",
+        "bedrooms", "bathrooms", "zoning",
+        "phone_carrier", "phone_line_type", "phone_valid", "phone_risk", "sms_email",
+        "email_valid", "email_disposable",
+        "beneficial_owner", "enrichment_sources",
+        "enrichment_status", "enrichment_date",
+        "readiness_score", "recommended_action",
+        "contact_window_days", "urgency_level",
+        "contractor_name", "contractor_phone", "score", "temperature",
+    }
+    updates = {}
+    for k, v in data.items():
+        if not v or k == "regrid_data":
+            continue
+        col = field_map.get(k, k)
+        if col in allowed_cols:
+            # Serialize lists/dicts to JSON strings for SQLite
+            if isinstance(v, (list, dict)):
+                import json as _json
+                updates[col] = _json.dumps(v)
+            else:
+                updates[col] = v
+
+    # Always persist enrichment fields even if data dict had them
+    enrichment_fields = ["owner_name", "owner_phone", "owner_email", "owner_address"]
+    for field in enrichment_fields:
+        if field not in updates and data.get(field):
+            updates[field] = data[field]
+
+    # Persist Regrid property data to the lead row
+    regrid = data.get("regrid_data", {})
+    if regrid:
+        regrid_field_map = {
+            "owner_name": "owner_name",
+            "owner_address": "owner_address",
+            "apn": "apn",
+            "market_value": "market_value",
+            "year_built": "year_built",
+            "square_feet": "square_feet",
+            "lot_size": "lot_size",
+            "bedrooms": "bedrooms",
+            "bathrooms": "bathrooms",
+            "zoning": "zoning",
+        }
+        for src_key, db_col in regrid_field_map.items():
+            val = regrid.get(src_key)
+            if val and db_col not in updates:
+                updates[db_col] = val
+
     updates["enrichment_status"] = "enriched"
     updates["enrichment_date"] = datetime.now().isoformat()
     update_lead(lead_id, updates)

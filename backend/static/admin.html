@@ -69,6 +69,7 @@
     <div class="tab" data-tab="compliance">Compliance</div>
     <div class="tab" data-tab="billing">Billing</div>
     <div class="tab" data-tab="logs">System Logs</div>
+    <div class="tab" data-tab="sources">Data Sources</div>
   </div>
 
   <!-- Overview Tab -->
@@ -131,15 +132,172 @@
     </div>
   </div>
 
-  <script>
-    const token = localStorage.getItem('onsite_token') || '';
+  <!-- Data Sources Tab -->
+  <div id="tab-sources" class="section">
+    <div class="kpi-row" id="src-kpis">
+      <div class="kpi"><div class="kpi-label">Total Sources</div><div class="kpi-value" id="src-total">—</div></div>
+      <div class="kpi"><div class="kpi-label">Verified</div><div class="kpi-value" id="src-verified">—</div></div>
+      <div class="kpi"><div class="kpi-label">Categories</div><div class="kpi-value" id="src-cats">—</div></div>
+      <div class="kpi"><div class="kpi-label">States</div><div class="kpi-value" id="src-states">—</div></div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input id="src-search" type="text" placeholder="Search sources..." style="flex:1;min-width:200px;padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;font-family:inherit;outline:none" />
+        <select id="src-cat-filter" style="padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;font-family:inherit;outline:none">
+          <option value="">All Categories</option>
+          <option value="permit">Permit</option>
+          <option value="property_data">Property Data</option>
+          <option value="property_sales">Property Sales</option>
+          <option value="insurance">Insurance</option>
+          <option value="inspection">Inspection</option>
+          <option value="contractor">Contractor</option>
+          <option value="zoning">Zoning</option>
+          <option value="code_enforcement">Code Enforcement</option>
+        </select>
+        <select id="src-state-filter" style="padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;font-family:inherit;outline:none">
+          <option value="">All States</option>
+        </select>
+        <button class="btn" onclick="loadSources()">Search</button>
+        <button class="btn btn-outline" onclick="importSources()">Import Catalog</button>
+        <button class="btn btn-outline" onclick="validateSources()">Validate</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Source Registry</h2>
+      <div id="src-table-wrap" style="overflow-x:auto">
+        <table id="src-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Type</th>
+              <th>Category</th>
+              <th>State</th>
+              <th>Status</th>
+              <th>Verified</th>
+              <th>Last Synced</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="src-tbody"><tr><td colspan="8" style="color:#94a3b8;text-align:center;padding:20px">Loading...</td></tr></tbody>
+        </table>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
+        <span id="src-count" style="font-size:11px;color:#64748b"></span>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-outline" id="src-prev" onclick="srcPage(-1)" disabled style="padding:6px 12px;font-size:11px">Prev</button>
+          <button class="btn btn-outline" id="src-next" onclick="srcPage(1)" style="padding:6px 12px;font-size:11px">Next</button>
+        </div>
+      </div>
+    </div>
+    <div class="grid" style="margin-top:16px">
+      <div class="card">
+        <h2>Categories Breakdown</h2>
+        <div id="src-cat-breakdown">Loading...</div>
+      </div>
+      <div class="card">
+        <h2>Recent Collection Runs</h2>
+        <div id="src-collection-status">Loading...</div>
+      </div>
+    </div>
+  </div>
 
-    async function fetchJSON(url) {
+  <!-- Login overlay -->
+  <div id="admin-login-overlay" style="position:fixed;inset:0;background:rgba(15,23,42,0.6);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;z-index:9999">
+    <div style="background:#fff;border-radius:16px;padding:36px 32px;width:360px;box-shadow:0 20px 60px rgba(0,0,0,0.15)">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+        <div style="width:36px;height:36px;background:linear-gradient(135deg,#3d8b7a,#267063);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px;font-weight:800">OS</div>
+        <div style="font-size:18px;font-weight:800">Admin Login</div>
+      </div>
+      <div id="login-error" style="display:none;background:#fef2f2;color:#991b1b;padding:10px 12px;border-radius:8px;font-size:12px;font-weight:600;margin-bottom:14px"></div>
+      <input id="admin-email" type="email" placeholder="Admin email" style="width:100%;padding:10px 14px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;font-family:inherit;margin-bottom:10px;outline:none" />
+      <input id="admin-password" type="password" placeholder="Password" style="width:100%;padding:10px 14px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;font-family:inherit;margin-bottom:16px;outline:none" />
+      <button id="admin-login-btn" class="btn" style="width:100%;padding:12px;font-size:14px" onclick="adminLogin()">Sign In</button>
+    </div>
+  </div>
+
+  <script>
+    function showAdminToast(msg, isError) {
+      const t = document.createElement('div');
+      t.style.cssText = 'position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:13px;font-weight:600;z-index:10000;transition:opacity .3s;' +
+        (isError ? 'background:#fef2f2;color:#991b1b;border:1px solid #fecaca' : 'background:#f0fdf4;color:#166534;border:1px solid #bbf7d0');
+      t.textContent = msg;
+      document.body.appendChild(t);
+      setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 3000);
+    }
+
+    let token = localStorage.getItem('onsite_token') || '';
+
+    async function adminLogin() {
+      const email = document.getElementById('admin-email').value.trim();
+      const pass = document.getElementById('admin-password').value;
+      const errEl = document.getElementById('login-error');
+      const btn = document.getElementById('admin-login-btn');
+      errEl.style.display = 'none';
+      btn.textContent = 'Signing in...';
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password: pass })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.token) throw new Error(data.detail || data.error || 'Login failed');
+        /* Check admin role */
+        const me = await fetch('/api/auth/me', { headers: { 'Authorization': 'Bearer ' + data.token } });
+        const user = await me.json();
+        if (user.role !== 'admin') throw new Error('Admin access required. Your role: ' + (user.role || 'user'));
+        token = data.token;
+        localStorage.setItem('onsite_token', token);
+        document.getElementById('admin-login-overlay').style.display = 'none';
+        refreshAll();
+      } catch (e) {
+        errEl.textContent = e.message;
+        errEl.style.display = 'block';
+      } finally {
+        btn.textContent = 'Sign In';
+        btn.disabled = false;
+      }
+    }
+
+    /* Allow Enter key to submit */
+    document.getElementById('admin-password').addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') adminLogin();
+    });
+
+    /* Auto-check existing token on load */
+    (async function checkAuth() {
+      if (!token) return;
+      try {
+        const res = await fetch('/api/auth/me', { headers: { 'Authorization': 'Bearer ' + token } });
+        if (!res.ok) throw new Error('Token expired');
+        const user = await res.json();
+        if (user.role !== 'admin') throw new Error('Not admin');
+        document.getElementById('admin-login-overlay').style.display = 'none';
+      } catch (e) {
+        token = '';
+        /* Show login overlay — already visible by default */
+      }
+    })();
+
+    const _fetchCache = {};
+    const _FETCH_CACHE_TTL = 15000; // 15s cache for admin API calls
+    async function fetchJSON(url, skipCache) {
+      const now = Date.now();
+      if (!skipCache && _fetchCache[url] && (now - _fetchCache[url].ts) < _FETCH_CACHE_TTL) {
+        return _fetchCache[url].data;
+      }
       const headers = {};
       if (token) headers['Authorization'] = 'Bearer ' + token;
       const res = await fetch(url, { headers });
+      if (res.status === 401) {
+        document.getElementById('admin-login-overlay').style.display = 'flex';
+        throw new Error('Unauthorized');
+      }
       if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
-      return res.json();
+      const data = await res.json();
+      _fetchCache[url] = { ts: now, data };
+      return data;
     }
 
     // Tabs
@@ -163,7 +321,10 @@
         const active = (d.sources || []).filter(s => s.active).length;
         document.getElementById('kpi-sources').textContent = active + '/' + (d.sources||[]).length;
       } catch(e) {}
-      document.getElementById('kpi-users').textContent = '—';
+      try {
+        const uc = await fetchJSON('/admin/system/user-count');
+        document.getElementById('kpi-users').textContent = uc.count || 0;
+      } catch(e) { document.getElementById('kpi-users').textContent = '—'; }
     }
 
     async function loadQueues() {
@@ -243,11 +404,35 @@
       `;
     }
 
+    async function loadLogs() {
+      try {
+        const lines = [];
+        try {
+          const h = await fetchJSON('/api/health');
+          lines.push('[SYSTEM] Status: ' + h.status + ', Version: ' + (h.version || 'unknown'));
+          if (h.checks) h.checks.forEach(c => lines.push('[CHECK] ' + c.name + ': ' + c.status));
+        } catch(e) {}
+        try {
+          const f = await fetchJSON('/admin/system/failures');
+          if (f && Object.keys(f).length) lines.push('[FAILURES] ' + JSON.stringify(f, null, 2));
+          else lines.push('[FAILURES] None');
+        } catch(e) {}
+        try {
+          const c = await fetchJSON('/api/admin/collection-status');
+          const logs = c.recent_syncs || c.logs || [];
+          logs.forEach(l => lines.push('[SYNC] ' + (l.source_name||'') + ': ' + (l.records_fetched||0) + ' fetched, status=' + (l.status||'ok') + ' at ' + (l.started_at||'')));
+        } catch(e) {}
+        document.getElementById('sysLogs').innerText = lines.join('\n') || 'No log data available';
+      } catch(e) {
+        document.getElementById('sysLogs').innerText = 'Error loading logs: ' + e.message;
+      }
+    }
+
     async function refreshAll() {
       document.getElementById('status').textContent = 'Refreshing...';
       document.getElementById('status').className = 'pill pill-warn';
       try {
-        await Promise.all([loadKPIs(), loadQueues(), loadBilling(), loadTerritories(), loadFailures(), loadLeads()]);
+        await Promise.all([loadKPIs(), loadQueues(), loadBilling(), loadTerritories(), loadFailures(), loadLeads(), loadLogs()]);
         loadCompliance();
         document.getElementById('status').textContent = 'OK';
         document.getElementById('status').className = 'pill pill-ok';
@@ -256,6 +441,144 @@
         document.getElementById('status').className = 'pill pill-err';
       }
     }
+
+    /* ---- Data Sources Tab ---- */
+    let srcCurrentPage = 1;
+    const srcPageSize = 50;
+
+    async function loadSourceStats() {
+      try {
+        const d = await fetchJSON('/api/admin/sources/stats');
+        document.getElementById('src-total').textContent = (d.total || 0).toLocaleString();
+        document.getElementById('src-verified').textContent = d.verified != null ? d.verified + '%' : '—';
+        document.getElementById('src-cats').textContent = d.by_category ? Object.keys(d.by_category).length : '—';
+        document.getElementById('src-states').textContent = d.by_state ? Object.keys(d.by_state).length : '—';
+        if (d.by_category) {
+          const rows = Object.entries(d.by_category).sort((a,b) => b[1]-a[1]).map(([k,v]) =>
+            `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f1f5f9"><span style="font-size:12px;font-weight:600">${k||'unknown'}</span><span style="font-size:12px;color:#267063;font-weight:700">${v}</span></div>`
+          ).join('');
+          document.getElementById('src-cat-breakdown').innerHTML = rows || '<span style="color:#94a3b8;font-size:12px">No data</span>';
+        }
+        /* Populate state filter */
+        if (d.by_state) {
+          const sel = document.getElementById('src-state-filter');
+          const current = sel.value;
+          sel.innerHTML = '<option value="">All States</option>' +
+            Object.keys(d.by_state).sort().map(s => `<option value="${s}">${s}</option>`).join('');
+          if (current) sel.value = current;
+        }
+      } catch(e) {
+        document.getElementById('src-total').textContent = 'Err';
+      }
+    }
+
+    async function loadSources() {
+      const q = document.getElementById('src-search').value.trim();
+      const cat = document.getElementById('src-cat-filter').value;
+      const state = document.getElementById('src-state-filter').value;
+      const params = new URLSearchParams({ page: srcCurrentPage, per_page: srcPageSize });
+      if (q) params.set('q', q);
+      if (cat) params.set('category', cat);
+      if (state) params.set('state', state);
+      try {
+        const d = await fetchJSON('/api/admin/sources?' + params);
+        const items = d.sources || d.items || d || [];
+        const total = d.total || items.length;
+        const tbody = document.getElementById('src-tbody');
+        if (!items.length) {
+          tbody.innerHTML = '<tr><td colspan="8" style="color:#94a3b8;text-align:center;padding:20px">No sources found</td></tr>';
+        } else {
+          tbody.innerHTML = items.map(s => `<tr>
+            <td style="font-weight:600;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(s.api_name||s.name||'').replace(/"/g,'&quot;')}">${s.api_name||s.name||'—'}</td>
+            <td><span class="pill ${s.source_type==='Socrata'?'pill-ok':s.source_type==='ArcGIS'?'pill-warn':'pill-err'}">${s.source_type||'—'}</span></td>
+            <td>${s.data_category||s.category||'—'}</td>
+            <td>${s.state||'—'}</td>
+            <td><span class="pill ${s.status==='active'?'pill-ok':'pill-err'}">${s.status||'—'}</span></td>
+            <td>${s.verified ? '&#10003;' : '—'}</td>
+            <td style="font-size:11px;color:#64748b">${s.last_synced ? new Date(s.last_synced).toLocaleDateString() : 'Never'}</td>
+            <td><button class="btn btn-outline" style="padding:4px 8px;font-size:10px" onclick="toggleSource(${s.id},'${s.status==='active'?'disabled':'active'}')">${s.status==='active'?'Disable':'Enable'}</button></td>
+          </tr>`).join('');
+        }
+        document.getElementById('src-count').textContent = `Showing ${(srcCurrentPage-1)*srcPageSize+1}-${Math.min(srcCurrentPage*srcPageSize, total)} of ${total}`;
+        document.getElementById('src-prev').disabled = srcCurrentPage <= 1;
+        document.getElementById('src-next').disabled = srcCurrentPage * srcPageSize >= total;
+      } catch(e) {
+        document.getElementById('src-tbody').innerHTML = `<tr><td colspan="8" style="color:#dc2626">${e.message}</td></tr>`;
+      }
+    }
+
+    function srcPage(dir) { srcCurrentPage = Math.max(1, srcCurrentPage + dir); loadSources(); }
+
+    async function toggleSource(id, newStatus) {
+      try {
+        await fetch('/api/admin/sources/' + id, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+          body: JSON.stringify({ status: newStatus })
+        });
+        loadSources();
+        loadSourceStats();
+      } catch(e) { showAdminToast('Failed: ' + e.message, true); }
+    }
+
+    async function importSources() {
+      if (!confirm('Import all catalog sources into the registry? This may take a moment.')) return;
+      try {
+        const res = await fetch('/api/admin/sources/import', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + token }
+        });
+        const d = await res.json();
+        showAdminToast('Import complete: ' + (d.message || JSON.stringify(d)));
+        loadSources();
+        loadSourceStats();
+      } catch(e) { showAdminToast('Import failed: ' + e.message, true); }
+    }
+
+    async function validateSources() {
+      if (!confirm('Start background validation of unverified sources?')) return;
+      try {
+        const res = await fetch('/api/admin/sources/validate', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + token }
+        });
+        const d = await res.json();
+        showAdminToast('Validation started: ' + (d.message || JSON.stringify(d)));
+      } catch(e) { showAdminToast('Validate failed: ' + e.message, true); }
+    }
+
+    async function loadCollectionStatus() {
+      try {
+        const d = await fetchJSON('/api/admin/collection-status');
+        const logs = d.recent_syncs || d.logs || [];
+        if (!logs.length) {
+          document.getElementById('src-collection-status').innerHTML = '<span style="color:#94a3b8;font-size:12px">No collection runs yet</span>';
+          return;
+        }
+        const rows = logs.map(l => `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f1f5f9;font-size:11px">
+          <span style="font-weight:600">${l.source_name||'—'}</span>
+          <span>${l.records_fetched||0} fetched, ${l.records_new||0} new</span>
+          <span style="color:#64748b">${l.started_at ? new Date(l.started_at).toLocaleDateString() : '—'}</span>
+        </div>`).join('');
+        document.getElementById('src-collection-status').innerHTML = rows;
+      } catch(e) {
+        document.getElementById('src-collection-status').innerHTML = '<span style="color:#94a3b8;font-size:12px">Not available</span>';
+      }
+    }
+
+    /* Hook tab-specific loads into tab switching */
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        if (tab.dataset.tab === 'sources') {
+          loadSourceStats();
+          loadSources();
+          loadCollectionStatus();
+        }
+        if (tab.dataset.tab === 'logs') {
+          loadLogs();
+        }
+      });
+    });
 
     refreshAll();
   </script>

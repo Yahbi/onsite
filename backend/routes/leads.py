@@ -4,16 +4,19 @@ All lead-related API endpoints
 """
 
 from fastapi import APIRouter, HTTPException, Query, Request, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from typing import Optional, List
+import csv
+import io
 import logging
 
-from backend.models.database import (
+from models.database import (
     query_leads, get_lead_by_id, update_lead, get_stats,
     get_leads_needing_enrichment, save_filter, get_saved_filters,
     delete_saved_filter, save_stage_transition, get_pipeline_history,
     create_notification, get_unread_notifications, mark_notifications_read,
 )
-from backend.core.scoring import compute_readiness, score_breakdown, is_insurance_claim
+from core.scoring import compute_readiness, score_breakdown, is_insurance_claim
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ async def get_leads_from_db(
     zip_list = [z.strip() for z in zips.split(",")] if zips else None
 
     leads, total = query_leads(
-        limit=min(limit, 500000),
+        limit=min(limit, 5000),
         offset=offset,
         city=city,
         state=state,
@@ -64,11 +67,8 @@ async def get_leads_from_db(
         zip_codes=zip_list,
     )
 
-    # Add readiness scores
-    enriched = []
-    for lead in leads:
-        readiness = compute_readiness(lead)
-        enriched.append({**lead, **readiness})
+    # Add readiness scores (batch — avoid N+1 dict-merge overhead)
+    enriched = [{**lead, **compute_readiness(lead)} for lead in leads]
 
     return {
         "leads": enriched,
@@ -223,8 +223,9 @@ async def get_competitors(lead_id: str):
         return {"competitors": []}
 
     nearby, _ = query_leads(
-        limit=50,
+        limit=20,
         bbox=(lat - 0.02, lng - 0.02, lat + 0.02, lng + 0.02),
+        contact_only=True,
     )
     competitors = [
         {
@@ -235,7 +236,7 @@ async def get_competitors(lead_id: str):
             "distance": "nearby",
         }
         for n in nearby
-        if n.get("contractor_name") and n.get("id") != lead_id
+        if n.get("contractor_name") and str(n.get("id")) != str(lead_id)
     ][:10]
 
     return {"competitors": competitors}
@@ -278,6 +279,95 @@ async def remove_filter(filter_id: str):
 # ============================================================================
 # NOTIFICATIONS
 # ============================================================================
+
+@router.post("/leads/bulk-stage")
+async def bulk_stage_change(payload: dict):
+    """Bulk update pipeline stage for multiple leads."""
+    lead_ids = payload.get("lead_ids", [])
+    new_stage = payload.get("stage", "")
+    notes = payload.get("notes", "")
+
+    if not lead_ids or not new_stage:
+        raise HTTPException(status_code=400, detail="lead_ids and stage are required")
+    if len(lead_ids) > 500:
+        raise HTTPException(status_code=400, detail="Max 500 leads per bulk operation")
+
+    valid_stages = {"new", "contacted", "qualified", "proposal", "won", "lost"}
+    if new_stage not in valid_stages:
+        raise HTTPException(status_code=400, detail=f"Invalid stage. Must be one of: {', '.join(valid_stages)}")
+
+    updated = 0
+    for lid in lead_ids:
+        lead = get_lead_by_id(str(lid))
+        if lead:
+            old_stage = lead.get("stage", "new")
+            save_stage_transition(str(lid), old_stage, new_stage, notes)
+            update_lead(str(lid), {"stage": new_stage})
+            updated += 1
+
+    return {"status": "ok", "updated": updated, "stage": new_stage}
+
+
+@router.get("/leads/export")
+async def export_leads_csv(
+    days: int = Query(None, description="Filter to permits issued in last N days"),
+    permit_type: Optional[str] = Query(None),
+    city: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    temperature: Optional[str] = Query(None),
+    min_score: Optional[int] = Query(None),
+    stage: Optional[str] = Query(None),
+    contact_only: bool = Query(False),
+    search: Optional[str] = Query(None),
+    zips: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+    limit: int = Query(50000, description="Max rows to export"),
+):
+    """Export leads as CSV with the same filters as /api/leads/db."""
+    zip_list = [z.strip() for z in zips.split(",")] if zips else None
+    capped_limit = min(limit, 50000)
+
+    leads, total = query_leads(
+        limit=capped_limit,
+        offset=0,
+        city=city,
+        state=state,
+        temperature=temperature,
+        min_score=min_score,
+        max_days=days,
+        permit_type=permit_type,
+        source=source,
+        stage=stage,
+        contact_only=contact_only,
+        search=search,
+        sort_by="score",
+        sort_dir="DESC",
+        zip_codes=zip_list,
+    )
+
+    if not leads:
+        raise HTTPException(status_code=404, detail="No leads match the given filters")
+
+    # Build CSV in memory
+    columns = [
+        "address", "city", "state", "zip", "permit_number", "permit_type",
+        "work_description", "valuation", "issue_date", "score", "temperature",
+        "owner_name", "owner_phone", "owner_email", "contractor_name",
+        "contractor_phone", "lat", "lng", "source", "stage",
+    ]
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for lead in leads:
+        writer.writerow({col: lead.get(col, "") for col in columns})
+
+    csv_bytes = output.getvalue().encode("utf-8")
+    return StreamingResponse(
+        io.BytesIO(csv_bytes),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=onsite_leads.csv"},
+    )
+
 
 @router.get("/notifications")
 async def list_notifications(limit: int = Query(50)):
