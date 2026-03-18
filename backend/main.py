@@ -173,6 +173,8 @@ def decode_jwt_token(token: str) -> Optional[dict]:
 
 
 def log_access(user_id: Optional[str], endpoint: str, req: Request):
+    """Fire-and-forget audit log — failures are silently ignored to avoid
+    blocking HTTP responses when the DB is under write contention."""
     try:
         conn = _conn()
         cur = conn.cursor()
@@ -188,8 +190,8 @@ def log_access(user_id: Optional[str], endpoint: str, req: Request):
         )
         conn.commit()
         conn.close()
-    except Exception as e:
-        logger.error("Failed to log access audit for %s: %s", endpoint, e)
+    except Exception:
+        pass  # Silently skip — audit is non-critical
 
 
 def load_entitlements(user_id: Optional[str]) -> Dict:
@@ -611,8 +613,8 @@ async def startup_event():
     # ── Owner Discovery: free background enrichment ──
     try:
         from services.enrichment_scheduler import owner_discovery_loop
-        asyncio.create_task(owner_discovery_loop(interval=300))
-        logger.info("Owner discovery background loop started (5-min interval)")
+        asyncio.create_task(owner_discovery_loop(interval=600))
+        logger.info("Owner discovery background loop started (10-min interval)")
     except Exception as e:
         logger.warning(f"Owner discovery setup failed: {e}")
 
@@ -622,8 +624,8 @@ async def startup_event():
         from models.database import get_leads_needing_enrichment, mark_enriched
 
         async def auto_enrich_after_sync():
-            """Auto-enrich leads after sync — batch of 50, 60s cooldown, circuit breaker."""
-            await asyncio.sleep(60)  # Wait for first sync to complete
+            """Auto-enrich leads after sync — throttled to avoid DB lock contention."""
+            await asyncio.sleep(120)  # Wait for startup to settle
             consecutive_failures = 0
             max_failures = 3  # Circuit breaker threshold
             while True:
@@ -632,12 +634,12 @@ async def startup_event():
                     await asyncio.sleep(600)
                     consecutive_failures = 0
                 try:
-                    leads = get_leads_needing_enrichment(limit=200)
+                    leads = get_leads_needing_enrichment(limit=20)
                     if not leads:
-                        await asyncio.sleep(300)  # Nothing to enrich, check again in 5min
+                        await asyncio.sleep(600)  # Nothing to enrich, check again in 10min
                         continue
                     logger.info("Auto-enriching %d leads...", len(leads))
-                    stats = await enrich_batch(leads, max_leads=200, concurrency=10)
+                    stats = await enrich_batch(leads, max_leads=20, concurrency=3)
                     enriched_count = stats.get("enriched", 0)
                     for lead in leads:
                         has_contact = lead.get("owner_phone") or lead.get("owner_email")
@@ -660,10 +662,10 @@ async def startup_event():
                 except Exception as e:
                     consecutive_failures += 1
                     logger.warning("Auto-enrichment error (%d/%d): %s", consecutive_failures, max_failures, e)
-                await asyncio.sleep(15)  # 15s cooldown between batches
+                await asyncio.sleep(120)  # 2min cooldown between batches to avoid DB lock
 
         asyncio.create_task(auto_enrich_after_sync())
-        logger.info("Auto-enrichment pipeline started (batch=200, cooldown=15s, concurrency=10, circuit_breaker=3)")
+        logger.info("Auto-enrichment pipeline started (batch=20, cooldown=120s, concurrency=3, circuit_breaker=3)")
     except ImportError as e:
         logger.info("Auto-enrichment not available: %s", e)
 

@@ -26,11 +26,13 @@ def _db_path():
 @contextmanager
 def get_db():
     """Context manager for database connections with WAL mode."""
-    conn = sqlite3.connect(_db_path(), timeout=30)
+    conn = sqlite3.connect(_db_path(), timeout=60)  # 60s timeout to survive lock contention
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA cache_size=-64000")  # 64MB page cache
     conn.execute("PRAGMA mmap_size=268435456")  # 256MB memory-mapped I/O
+    conn.execute("PRAGMA busy_timeout=60000")  # 60s retry on SQLITE_BUSY
+    conn.execute("PRAGMA wal_autocheckpoint=1000")  # checkpoint every 1000 pages
     conn.row_factory = sqlite3.Row
     try:
         yield conn
