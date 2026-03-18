@@ -480,13 +480,18 @@ except ImportError as e:
 # ============================================================================
 
 async def periodic_sync():
-    """Continuously refresh leads at configured interval."""
+    """Continuously refresh leads at configured interval.
+
+    Delays first sync by 30s so the app can serve requests immediately
+    on startup instead of locking the DB with a heavy sync operation.
+    """
+    await asyncio.sleep(30)  # Let the app start serving first
     while True:
         try:
             await sync_data()
         except Exception as e:  # pragma: no cover
             logger.error(f"Periodic sync error: {e}")
-        await asyncio.sleep(REFRESH_INTERVAL_SEC)
+        await asyncio.sleep(max(REFRESH_INTERVAL_SEC, 600))  # Min 10min between syncs
 
 
 async def periodic_yelp_intents():
