@@ -143,7 +143,7 @@ async def sync_data():
             try:
                 from services.source_registry import get_sources_for_sync, mark_synced, retry_disabled_sources
                 from services.fetchers import fetch_from_source
-                max_sources = int(os.getenv("SYNC_MAX_SOURCES", "50"))  # Throttled: 50 per cycle
+                max_sources = int(os.getenv("SYNC_MAX_SOURCES", "20"))  # Throttled to avoid fd exhaustion
                 # Re-enable disabled sources past cooldown for retry
                 try:
                     retried = retry_disabled_sources(cooldown_days=7, max_retries=20)
