@@ -1267,16 +1267,21 @@ const TMap = React.memo(function TMap({
       { maxZoom: 19, maxNativeZoom: 18 }
     ).addTo(map);
 
-    /* Canvas overlay for lead dots */
+    /* Canvas overlay for lead dots — placed in Leaflet's overlay pane
+       so it receives the same CSS transform during zoom animation,
+       preventing dots from "sliding" relative to tiles. */
     const cvs = document.createElement('canvas');
     cvs.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:450;';
+    /* Use the map container (not a pane) but sync origin to Leaflet's pixel origin */
     el.appendChild(cvs);
     canvasOverlayRef.current = cvs;
 
-    /* Redraw leads on every map move/zoom */
+    /* Redraw leads on every map move/zoom — use 'move' for smooth tracking */
     const onMove = () => scheduleDraw();
     map.on('move', onMove);
     map.on('moveend', onMove);
+    /* Also redraw during zoom animation for smooth dot tracking */
+    map.on('zoom', onMove);
     /* Lock clusters during zoom animation — defer layout recalc to zoomend */
     map.on('zoomstart', () => { zoomingRef.current = true; });
     map.on('zoomend', () => {
