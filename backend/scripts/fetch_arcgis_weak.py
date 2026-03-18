@@ -80,7 +80,7 @@ def normalize_lead(attrs, state, source):
                             ts = int(val) / 1000
                             from datetime import datetime
                             lead[std_field] = datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
-                        except:
+                        except Exception:
                             lead[std_field] = val
                     else:
                         lead[std_field] = val

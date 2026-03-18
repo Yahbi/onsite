@@ -15,11 +15,13 @@ import re
 import time
 from typing import Optional
 
+import os
+
 import httpx
 
 logger = logging.getLogger(__name__)
 
-API_KEY = "f5577680db464a06ae7772590e28116f"
+API_KEY = os.getenv("PHONE_INTELLIGENCE_API_KEY", "")
 BASE_URL = "https://phoneintelligence.abstractapi.com/v1/"
 
 _cache: dict[str, dict] = {}

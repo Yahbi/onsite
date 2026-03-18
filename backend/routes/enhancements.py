@@ -3,7 +3,7 @@ Onsite - Enhancement Features
 Auto-enrichment, CSV export, AI scoring
 """
 
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 from typing import Optional, List
 from datetime import datetime
@@ -39,8 +39,8 @@ async def trigger_auto_enrichment(
 
     try:
         # Import enrichment services
-        from backend.services.ownership import OwnershipLookupService
-        from backend.models.database import get_db
+        from services.ownership import OwnershipLookupService
+        from models.database import get_db
 
         # Find unenriched leads
         with get_db() as conn:
@@ -63,7 +63,9 @@ async def trigger_auto_enrichment(
             if filters:
                 query += " AND " + " AND ".join(filters)
 
-            query += f" ORDER BY valuation DESC, score DESC LIMIT {limit}"
+            limit = min(int(limit), 5000)
+            query += " ORDER BY valuation DESC, score DESC LIMIT ?"
+            params.append(limit)
 
             cursor = conn.execute(query, params)
             unenriched = cursor.fetchall()
@@ -143,8 +145,8 @@ async def get_enrichment_stats():
     """Get enrichment statistics and API key usage"""
 
     try:
-        from backend.models.database import get_db
-        from backend.services.ownership import PropertyReachRotator
+        from models.database import get_db
+        from services.ownership import PropertyReachRotator
 
         with get_db() as conn:
             stats = {
@@ -169,7 +171,8 @@ async def get_enrichment_stats():
         try:
             rotator = PropertyReachRotator()
             stats["api_keys"] = rotator.get_stats()
-        except:
+        except Exception as e:
+            logger.warning("Failed to load API key stats: %s", e)
             stats["api_keys"] = {"error": "Could not load API key stats"}
 
         return stats
@@ -184,6 +187,7 @@ async def get_enrichment_stats():
 
 @router.get("/export/csv")
 async def export_leads_csv(
+    request: Request = None,
     city: Optional[str] = Query(None),
     state: Optional[str] = Query(None),
     min_score: Optional[int] = Query(None),
@@ -200,10 +204,24 @@ async def export_leads_csv(
     - "Export 100 hot LA leads"
     - "Export all $500k+ permits with owner contacts"
     - "Export Seattle leads from last 30 days"
+    Requires Starter plan or higher.
     """
+    # --- Plan enforcement: CSV export requires Starter+ ---
+    try:
+        from main import get_user_plan_from_request, get_plan_limits
+        _plan_info = get_user_plan_from_request(request) if request else {"plan": "reveal"}
+        _plan_name = _plan_info.get("plan", "reveal").lower()
+        _plan_lim = get_plan_limits(_plan_name)
+        if not _plan_lim.get("csv_export", False):
+            raise HTTPException(status_code=403, detail="CSV export requires Starter plan or higher")
+    except HTTPException:
+        raise
+    except ImportError:
+        # If main module import fails, deny by default for safety
+        raise HTTPException(status_code=403, detail="CSV export requires Starter plan or higher")
 
     try:
-        from backend.models.database import get_db
+        from models.database import get_db
 
         # Build dynamic query
         query = "SELECT * FROM leads WHERE 1=1"
@@ -231,12 +249,14 @@ async def export_leads_csv(
 
         if temperature:
             query += " AND temperature = ?"
-            params.append(temperature.capitalize())
+            params.append(temperature.lower())
 
         if enriched_only:
             query += " AND owner_name IS NOT NULL AND owner_name != ''"
 
-        query += f" ORDER BY score DESC, valuation DESC LIMIT {limit}"
+        limit = min(int(limit), 5000)
+        query += " ORDER BY score DESC, valuation DESC LIMIT ?"
+        params.append(limit)
 
         # Execute query
         with get_db() as conn:
@@ -288,7 +308,7 @@ async def rescore_all_leads(background_tasks: BackgroundTasks):
 
     async def rescore_batch():
         try:
-            from backend.models.database import get_db
+            from models.database import get_db
 
             with get_db() as conn:
                 leads = conn.execute("SELECT id, days_old, valuation, permit_type, owner_name FROM leads").fetchall()
@@ -315,11 +335,11 @@ async def rescore_all_leads(background_tasks: BackgroundTasks):
 
                     # Determine temperature
                     if total_score >= 70:
-                        temperature = "Hot"
+                        temperature = "hot"
                     elif total_score >= 50:
-                        temperature = "Warm"
+                        temperature = "warm"
                     else:
-                        temperature = "Cold"
+                        temperature = "cold"
 
                     # Update database
                     conn.execute("""
@@ -354,7 +374,7 @@ async def get_top_opportunities(
     """
 
     try:
-        from backend.models.database import get_db
+        from models.database import get_db
 
         query = """
             SELECT id, permit_number, address, city, valuation, score, temperature,
@@ -368,7 +388,9 @@ async def get_top_opportunities(
             query += " AND city = ?"
             params.append(city)
 
-        query += f" ORDER BY score DESC, valuation DESC LIMIT {limit}"
+        limit = min(int(limit), 5000)
+        query += " ORDER BY score DESC, valuation DESC LIMIT ?"
+        params.append(limit)
 
         with get_db() as conn:
             conn.row_factory = sqlite3.Row

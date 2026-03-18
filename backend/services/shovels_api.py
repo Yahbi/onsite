@@ -260,8 +260,8 @@ def transform_shovels_permit_to_lead(permit: Dict) -> Dict:
             issue_dt = datetime.fromisoformat(issue_date_str.replace("Z", "+00:00"))
             issue_date = issue_dt.strftime("%Y-%m-%d")
             days_old = (datetime.utcnow() - issue_dt.replace(tzinfo=None)).days
-        except:
-            pass
+        except Exception as e:
+            logger.warning("Failed to parse issue date '%s': %s", issue_date_str, e)
 
     # Calculate score
     score = 50  # Base score
@@ -274,11 +274,11 @@ def transform_shovels_permit_to_lead(permit: Dict) -> Dict:
 
     # Determine temperature
     if score >= 70:
-        temperature = "Hot"
+        temperature = "hot"
     elif score >= 50:
-        temperature = "Warm"
+        temperature = "warm"
     else:
-        temperature = "Cold"
+        temperature = "cold"
 
     # Extract permit type
     permit_type = permit.get("permit_type") or permit.get("work_type") or "Building"

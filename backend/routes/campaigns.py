@@ -23,7 +23,7 @@ def _get_email_service():
     global _email_service
     if _email_service is None:
         try:
-            from backend.services.email_service import send_email
+            from services.email_service import send_email
             _email_service = send_email
         except Exception as e:
             logger.warning(f"Email service unavailable: {e}")
@@ -34,7 +34,7 @@ def _get_sms_service():
     global _sms_service
     if _sms_service is None:
         try:
-            from backend.services.sms_campaigns import SMSCampaignService
+            from services.sms_campaigns import SMSCampaignService
             _sms_service = SMSCampaignService()
         except Exception as e:
             logger.warning(f"SMS service unavailable: {e}")
@@ -45,7 +45,7 @@ def _get_crm_manager():
     global _crm_manager
     if _crm_manager is None:
         try:
-            from backend.services.crm_integrations import CRMManager
+            from services.crm_integrations import CRMManager
             _crm_manager = CRMManager()
         except Exception as e:
             logger.warning(f"CRM manager unavailable: {e}")
@@ -153,10 +153,10 @@ async def crm_sync_leads(crm_name: str, request: Request):
         body = {}
     lead_ids = body.get("lead_ids")
 
-    return {"success": True, "crm": crm_name, "synced": 0, "message": f"CRM sync queued for {crm_name}"}
+    return {"status": "not_implemented", "message": "CRM sync is not yet available. Coming soon."}
 
 
 @router.post("/crm/disconnect/{crm_name}")
 async def crm_disconnect(crm_name: str):
     """Disconnect a CRM integration."""
-    return {"success": True, "crm": crm_name, "message": f"{crm_name} disconnected"}
+    return {"status": "not_implemented", "message": "CRM disconnect is not yet available. Token cleanup not implemented."}

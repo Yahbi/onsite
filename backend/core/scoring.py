@@ -1,16 +1,24 @@
 """
-Onsite Lead Scoring Engine v2.0
-Multi-factor scoring with advanced heuristics and ML-ready structure
+Onsite Lead Scoring Engine v3.0
+Rebalanced for real-world permit data distributions.
+
+Key changes from v2.0:
+- Removed Project Value category (96.5% of leads have $0 valuation)
+- Removed Owner Type category (folded into contact scoring)
+- Added Project Indicators from work_description keywords
+- Added Property Data bonus (market_value, square_feet)
+- Implemented Enrichment Status bonus
+- Rebalanced weights to reflect actual data availability
 
 Scoring Factors:
-- Recency (0-30 points): How recent the permit was filed
-- Project Value (0-20 points): Valuation amount
-- Permit Type (0-15 points): High-value vs low-value work types
-- Contact Availability (0-15 points): Owner info completeness
-- Geographic Quality (0-10 points): Property location signals
-- Owner Type (0-10 points): Individual vs corporate/trust
+- Recency (0-35 points): How recent the permit was filed
+- Permit Type (0-20 points): High-value vs low-value work types
+- Geographic Quality (0-15 points): Location completeness + market
+- Project Indicators (0-15 points): Description keyword analysis
+- Contact Availability (0-10 points): Owner info completeness
+- Property Data Bonus (0-5 points): market_value / square_feet present
 - Enrichment Status (0-5 points): Data completeness bonus
-- Insurance Signals (0-20 points): Fire/water/storm damage indicators
+- Insurance Signals (0-20 points): Fire/water/storm damage indicators (bonus)
 """
 
 import re
@@ -20,255 +28,343 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# ── Canonical temperature thresholds (single source of truth) ──
+# Recalibrated for v3.0 scoring distribution.
+# Hot ≥30: Recent + strong signals → act now
+# Warm ≥25: Above-average signals → pursue
+# Med ≥20: Standard permits
+# Cold <20: Minimal signals
+TEMP_THRESHOLDS = {"hot": 30, "warm": 22, "med": 15, "cold": 0}
 
-def calculate_score_v2(lead: dict) -> Tuple[int, str, dict]:
-    """
-    Enhanced multi-factor lead scoring algorithm (v2.0).
-    Returns (score, temperature, breakdown_dict).
 
-    Scoring breakdown:
-    - Recency: 0-30 points
-    - Project Value: 0-20 points
-    - Permit Type: 0-15 points
-    - Contact Info: 0-15 points
-    - Geographic Quality: 0-10 points
-    - Owner Type: 0-10 points
-    - Insurance Signals: 0-20 points (bonus, can exceed 100)
+# ── Project indicator keyword tiers ──
+PROJECT_TIERS = (
+    (15, ("new construction", "commercial")),
+    (12, ("addition", "remodel", "renovation")),
+    (10, ("solar", "roof replacement")),
+    (8,  ("hvac", "plumbing", "electrical")),
+    (3,  ("fence", "shed", "deck")),
+)
+
+
+def classify_temperature(score: int) -> str:
+    """Classify a score into a 4-tier temperature label (lowercase).
+    Hot >=30, Warm >=25, Med >=20, Cold <20.
     """
+    if score >= TEMP_THRESHOLDS["hot"]:
+        return "hot"
+    elif score >= TEMP_THRESHOLDS["warm"]:
+        return "warm"
+    elif score >= TEMP_THRESHOLDS["med"]:
+        return "med"
+    return "cold"
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """Safely convert a value to int."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    """Safely convert a value to float."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _extract_lead_fields(lead: dict) -> dict:
+    """Extract and normalize all fields from a lead dict.
+    Returns a new dict with cleaned values (immutable pattern).
+    """
+    return {
+        "days_old": _safe_int(lead.get("days_old"), 999),
+        "valuation": _safe_float(lead.get("valuation")),
+        "permit_type": (lead.get("permit_type") or "").lower(),
+        "work_desc": (lead.get("work_description") or "").lower(),
+        "desc_full": (lead.get("description_full") or "").lower(),
+        "owner_name": lead.get("owner_name") or "",
+        "owner_phone": lead.get("owner_phone") or "",
+        "owner_email": lead.get("owner_email") or "",
+        "city": (lead.get("city") or "").lower(),
+        "state": (lead.get("state") or "").upper(),
+        "zip_code": lead.get("zip_code") or lead.get("zip") or "",
+        "market_value": _safe_float(lead.get("market_value")),
+        "square_feet": _safe_float(lead.get("square_feet")),
+        "enrichment_status": (lead.get("enrichment_status") or "").lower(),
+    }
+
+
+def _score_recency(days_old: int) -> Tuple[int, str]:
+    """Score recency (0-35 points). Most reliable signal."""
+    tiers = (
+        (1, 35), (3, 32), (5, 28), (7, 24), (10, 19),
+        (14, 14), (21, 10), (30, 6), (45, 3), (60, 2), (90, 1),
+    )
+    for threshold, pts in tiers:
+        if days_old <= threshold:
+            detail = f"{days_old} day{'s' if days_old != 1 else ''} old"
+            return pts, detail
+    return 0, f"{days_old} days old"
+
+
+def _score_permit_type(permit_type: str, work_desc: str) -> Tuple[int, str]:
+    """Score permit type (0-20 points). Expanded keyword matching."""
+    combined = f"{permit_type} {work_desc}"
+
+    ultra_high = [
+        "new construction", "new building", "new single family",
+        "new commercial", "new multi", "ground up",
+    ]
+    high_value = [
+        "addition", "remodel", "renovation", "tenant improvement",
+        "solar", "adu", "accessory dwelling", "second story",
+        "conversion", "seismic retrofit", "foundation",
+    ]
+    medium_value = [
+        "alteration", "repair", "electrical", "plumbing", "mechanical",
+        "hvac", "roof", "reroof", "window", "siding", "insulation",
+        "fire sprinkler", "elevator",
+    ]
+    low_value = [
+        "demolition", "sign", "fence", "grading", "pool", "shed",
+        "deck", "patio", "driveway", "retaining wall",
+    ]
+
+    if any(t in combined for t in ultra_high):
+        return 20, "New Construction"
+    if any(t in combined for t in high_value):
+        return 16, "Major Renovation"
+    if any(t in combined for t in medium_value):
+        return 10, "Standard Repair"
+    if any(t in combined for t in low_value):
+        return 4, "Minor Work"
+    # Fallback: any permit_type text gets partial credit
+    if permit_type.strip():
+        return 7, permit_type[:30]
+    return 5, "Unspecified"
+
+
+def _score_geography(city: str, state: str, zip_code: str) -> Tuple[int, str]:
+    """Score geographic quality (0-15 points). Rewards completeness."""
+    premium_cities = frozenset([
+        "los angeles", "san francisco", "san jose", "seattle", "portland",
+        "san diego", "denver", "austin", "miami", "atlanta", "boston",
+        "new york", "chicago", "washington", "houston", "dallas",
+        "phoenix", "nashville", "charlotte", "raleigh", "tampa",
+    ])
+    strong_states = frozenset([
+        "CA", "NY", "WA", "TX", "FL", "CO", "MA", "GA", "NC", "AZ",
+        "TN", "OR", "VA", "IL", "NJ",
+    ])
+
     score = 0
-    breakdown = {}
+    detail_parts = []
 
-    days_old = lead.get("days_old", 999)
-    valuation = lead.get("valuation", 0)
-    permit_type = (lead.get("permit_type") or "").lower()
-    work_desc = (lead.get("work_description") or "").lower()
-    desc_full = (lead.get("description_full") or "").lower()
-    owner_name = lead.get("owner_name", "")
-    owner_phone = lead.get("owner_phone", "")
-    owner_email = lead.get("owner_email", "")
-    city = (lead.get("city") or "").lower()
-    state = (lead.get("state") or "").upper()
+    # Completeness bonus: city + state + zip = full location
+    if city:
+        score += 2
+    if state:
+        score += 2
+    if zip_code:
+        score += 2
 
-    # 1. RECENCY SCORE (0-30 points) - Most critical factor
-    recency_score = 0
-    if days_old <= 1:
-        recency_score = 30
-    elif days_old <= 3:
-        recency_score = 27
-    elif days_old <= 5:
-        recency_score = 24
-    elif days_old <= 7:
-        recency_score = 20
-    elif days_old <= 10:
-        recency_score = 16
-    elif days_old <= 14:
-        recency_score = 12
-    elif days_old <= 21:
-        recency_score = 8
-    elif days_old <= 30:
-        recency_score = 4
-    elif days_old <= 45:
-        recency_score = 2
+    # Market quality bonus
+    if any(city.startswith(metro) or metro in city for metro in premium_cities):
+        score += 9
+        detail_parts.append(f"{city.title()} (Premium market)")
+    elif state in strong_states:
+        score += 6
+        detail_parts.append(f"{state} (Strong market)")
+    elif state:
+        score += 3
+        detail_parts.append(state)
     else:
-        recency_score = 0
+        detail_parts.append("Unknown location")
 
-    score += recency_score
-    breakdown["recency"] = {
-        "score": recency_score,
-        "max": 30,
-        "detail": f"{days_old} day{'s' if days_old != 1 else ''} old"
-    }
+    return min(15, score), ", ".join(detail_parts)
 
-    # 2. PROJECT VALUE SCORE (0-20 points)
-    value_score = 0
-    if valuation >= 1000000:
-        value_score = 20
-    elif valuation >= 500000:
-        value_score = 18
-    elif valuation >= 250000:
-        value_score = 15
-    elif valuation >= 100000:
-        value_score = 12
-    elif valuation >= 50000:
-        value_score = 8
-    elif valuation >= 25000:
-        value_score = 5
-    elif valuation >= 10000:
-        value_score = 3
-    else:
-        value_score = 0
 
-    score += value_score
-    breakdown["value"] = {
-        "score": value_score,
-        "max": 20,
-        "detail": f"${valuation:,.0f}" if valuation > 0 else "Not specified"
-    }
+def _score_project_indicators(work_desc: str, desc_full: str) -> Tuple[int, str]:
+    """Score project indicators from description keywords (0-15 points)."""
+    combined = f"{work_desc} {desc_full}"
+    if not combined.strip():
+        return 0, "No description"
 
-    # 3. PERMIT TYPE SCORE (0-15 points)
-    type_score = 0
-    type_detail = "Unknown"
+    best_score = 0
+    matched_keywords = []
 
-    # Ultra-high value types
-    ultra_high = ["new construction", "new building", "new single family", "new commercial"]
-    # High value types
-    high_value = ["addition", "remodel", "renovation", "tenant improvement",
-                  "solar", "adu", "accessory dwelling", "second story"]
-    # Medium value types
-    medium_value = ["alteration", "repair", "electrical", "plumbing", "mechanical",
-                    "hvac", "roof", "reroof", "window", "siding"]
-    # Low value types
-    low_value = ["demolition", "sign", "fence", "grading", "pool", "shed"]
+    for pts, keywords in PROJECT_TIERS:
+        for kw in keywords:
+            if kw in combined:
+                matched_keywords.append(kw)
+                if pts > best_score:
+                    best_score = pts
 
-    combined_text = f"{permit_type} {work_desc}"
+    if not matched_keywords:
+        return 0, "No project indicators"
 
-    if any(t in combined_text for t in ultra_high):
-        type_score = 15
-        type_detail = "New Construction"
-    elif any(t in combined_text for t in high_value):
-        type_score = 12
-        type_detail = "Major Renovation"
-    elif any(t in combined_text for t in medium_value):
-        type_score = 7
-        type_detail = "Standard Repair"
-    elif any(t in combined_text for t in low_value):
-        type_score = 2
-        type_detail = "Minor Work"
-    else:
-        type_score = 5
-        type_detail = permit_type[:30] if permit_type else "Unspecified"
+    return min(15, best_score), f"Matched: {', '.join(matched_keywords[:3])}"
 
-    score += type_score
-    breakdown["permit_type"] = {
-        "score": type_score,
-        "max": 15,
-        "detail": type_detail
-    }
 
-    # 4. CONTACT AVAILABILITY SCORE (0-15 points)
-    contact_score = 0
-    contact_detail = []
+def _score_contact(owner_name: str, owner_phone: str, owner_email: str) -> Tuple[int, str]:
+    """Score contact availability (0-10 points)."""
+    score = 0
+    details = []
 
     if owner_phone:
-        contact_score += 8
-        contact_detail.append("Phone")
+        score += 5
+        details.append("Phone")
     if owner_email:
-        contact_score += 5
-        contact_detail.append("Email")
+        score += 3
+        details.append("Email")
     if owner_name and owner_name.strip():
-        contact_score += 2
-        contact_detail.append("Name")
+        score += 2
+        details.append("Name")
 
-    score += contact_score
-    breakdown["contact"] = {
-        "score": contact_score,
-        "max": 15,
-        "detail": ", ".join(contact_detail) if contact_detail else "No contact info"
+    return min(10, score), ", ".join(details) if details else "No contact info"
+
+
+def _score_property_data(market_value: float, square_feet: float) -> Tuple[int, str]:
+    """Score property data bonus (0-5 points)."""
+    score = 0
+    details = []
+
+    if market_value > 0:
+        score += 3
+        details.append(f"Value: ${market_value:,.0f}")
+    if square_feet > 0:
+        score += 2
+        details.append(f"SqFt: {square_feet:,.0f}")
+
+    return score, ", ".join(details) if details else "No property data"
+
+
+def _score_enrichment(enrichment_status: str) -> Tuple[int, str]:
+    """Score enrichment status bonus (0-5 points)."""
+    status_scores = {
+        "fully_enriched": 5,
+        "enriched": 5,
+        "partially_enriched": 3,
+        "partial": 3,
+        "basic": 1,
+        "pending": 0,
+        "failed": 0,
     }
+    score = status_scores.get(enrichment_status, 0)
+    detail = enrichment_status if enrichment_status else "Not enriched"
+    return score, detail
 
-    # 5. GEOGRAPHIC QUALITY SCORE (0-10 points)
-    geo_score = 0
-    geo_detail = "Unknown location"
 
-    # High-value metro areas
-    premium_cities = ["los angeles", "san francisco", "san jose", "seattle", "portland",
-                      "san diego", "denver", "austin", "miami", "atlanta", "boston",
-                      "new york", "chicago", "washington"]
-
-    if any(city.startswith(metro) or metro in city for metro in premium_cities):
-        geo_score = 10
-        geo_detail = f"{city.title()} (Premium market)"
-    elif state in ["CA", "NY", "WA", "TX", "FL", "CO", "MA"]:
-        geo_score = 7
-        geo_detail = f"{state} (Strong market)"
-    else:
-        geo_score = 5
-        geo_detail = f"{state or 'Unknown'}"
-
-    score += geo_score
-    breakdown["geography"] = {
-        "score": geo_score,
-        "max": 10,
-        "detail": geo_detail
-    }
-
-    # 6. OWNER TYPE SCORE (0-10 points)
-    owner_score = 0
-    owner_detail = "Unknown"
-
-    if owner_name:
-        name_upper = owner_name.upper()
-        if any(indicator in name_upper for indicator in ["LLC", "INC", "CORP", "LP", "LTD"]):
-            owner_score = 5
-            owner_detail = "Corporate (harder reach)"
-        elif "TRUST" in name_upper:
-            owner_score = 6
-            owner_detail = "Trust (moderate)"
-        else:
-            owner_score = 10
-            owner_detail = "Individual (best)"
-
-    score += owner_score
-    breakdown["owner_type"] = {
-        "score": owner_score,
-        "max": 10,
-        "detail": owner_detail
-    }
-
-    # 7. INSURANCE/EMERGENCY SIGNALS (BONUS: 0-20 points)
-    insurance_score = 0
-    insurance_detail = "None detected"
-
+def _score_insurance(permit_type: str, work_desc: str, desc_full: str) -> Tuple[int, str]:
+    """Score insurance/emergency signals (bonus: 0-20 points)."""
     insurance_keywords = [
         "fire", "water damage", "flood", "storm", "wind damage",
         "insurance", "restoration", "remediation", "mold", "smoke",
-        "emergency", "casualty", "disaster", "hail", "vandalism"
+        "emergency", "casualty", "disaster", "hail", "vandalism",
     ]
+    combined = f"{permit_type} {work_desc} {desc_full}"
+    detected = [kw for kw in insurance_keywords if kw in combined]
 
-    combined_desc = f"{permit_type} {work_desc} {desc_full}"
-    detected_signals = [kw for kw in insurance_keywords if kw in combined_desc]
+    if not detected:
+        return 0, "None detected"
+    return min(20, len(detected) * 5), f"Detected: {', '.join(detected[:3])}"
 
-    if detected_signals:
-        insurance_score = min(20, len(detected_signals) * 5)
-        insurance_detail = f"Detected: {', '.join(detected_signals[:3])}"
 
-    score += insurance_score
-    breakdown["insurance"] = {
-        "score": insurance_score,
-        "max": 20,
-        "detail": insurance_detail
+def calculate_score_v2(lead: dict) -> Tuple[int, str, dict]:
+    """
+    Enhanced multi-factor lead scoring algorithm (v3.0).
+    Returns (score, temperature, breakdown_dict).
+
+    Rebalanced for real permit data where most leads lack
+    valuation, phone, and email data.
+
+    Scoring breakdown:
+    - Recency: 0-35 points
+    - Permit Type: 0-20 points
+    - Geographic Quality: 0-15 points
+    - Project Indicators: 0-15 points
+    - Contact Info: 0-10 points
+    - Property Data: 0-5 points
+    - Enrichment Status: 0-5 points
+    - Insurance Signals: 0-20 points (bonus, can exceed 100)
+    """
+    fields = _extract_lead_fields(lead)
+
+    recency_pts, recency_detail = _score_recency(fields["days_old"])
+    permit_pts, permit_detail = _score_permit_type(
+        fields["permit_type"], fields["work_desc"],
+    )
+    geo_pts, geo_detail = _score_geography(
+        fields["city"], fields["state"], fields["zip_code"],
+    )
+    project_pts, project_detail = _score_project_indicators(
+        fields["work_desc"], fields["desc_full"],
+    )
+    contact_pts, contact_detail = _score_contact(
+        fields["owner_name"], fields["owner_phone"], fields["owner_email"],
+    )
+    property_pts, property_detail = _score_property_data(
+        fields["market_value"], fields["square_feet"],
+    )
+    enrichment_pts, enrichment_detail = _score_enrichment(
+        fields["enrichment_status"],
+    )
+    insurance_pts, insurance_detail = _score_insurance(
+        fields["permit_type"], fields["work_desc"], fields["desc_full"],
+    )
+
+    total = (
+        recency_pts + permit_pts + geo_pts + project_pts
+        + contact_pts + property_pts + enrichment_pts + insurance_pts
+    )
+    total = min(100, total)
+
+    breakdown = {
+        "recency": {"score": recency_pts, "max": 35, "detail": recency_detail},
+        "permit_type": {"score": permit_pts, "max": 20, "detail": permit_detail},
+        "geography": {"score": geo_pts, "max": 15, "detail": geo_detail},
+        "project_indicators": {"score": project_pts, "max": 15, "detail": project_detail},
+        "contact": {"score": contact_pts, "max": 10, "detail": contact_detail},
+        "property_data": {"score": property_pts, "max": 5, "detail": property_detail},
+        "enrichment": {"score": enrichment_pts, "max": 5, "detail": enrichment_detail},
+        "insurance": {"score": insurance_pts, "max": 20, "detail": insurance_detail},
+        "total": total,
     }
 
-    # TOTAL SCORE (can exceed 100 with insurance bonus)
-    score = min(125, score)  # Cap at 125
-    breakdown["total"] = score
-
-    # TEMPERATURE CLASSIFICATION
-    if score >= 90:
-        temperature = "Hot"
-    elif score >= 75:
-        temperature = "Hot"
-    elif score >= 50:
-        temperature = "Warm"
-    else:
-        temperature = "Cold"
-
-    return score, temperature, breakdown
+    temperature = classify_temperature(total)
+    return total, temperature, breakdown
 
 
-def calculate_score(days_old: int, valuation: float, permit_type: str) -> Tuple[int, str]:
+def calculate_score(days_old: int, valuation: float, permit_type: str) -> Tuple[int, str, str]:
     """
-    Legacy scoring function for backwards compatibility.
-    Use calculate_score_v2() for enhanced multi-factor scoring.
+    Convenience wrapper for calculate_score_v2.
+    Returns (score, temperature, urgency) — same 3-tuple that callers expect.
     """
-    # Convert to lead dict and use v2
     lead = {
         "days_old": days_old,
         "valuation": valuation,
-        "permit_type": permit_type
+        "permit_type": permit_type,
     }
     score, temp, _ = calculate_score_v2(lead)
-    return score, temp
+
+    if days_old <= 3 and score >= 80:
+        urgency = "CRITICAL"
+    elif days_old <= 7 and score >= 70:
+        urgency = "HIGH"
+    elif days_old <= 14 or score >= 65:
+        urgency = "MEDIUM"
+    else:
+        urgency = "LOW"
+
+    return score, temp, urgency
 
 
 def compute_readiness(lead: dict) -> dict:
@@ -279,14 +375,14 @@ def compute_readiness(lead: dict) -> dict:
     """
     score = 0
     signals = []
-    
-    days_old = lead.get("days_old", 999)
-    valuation = lead.get("valuation", 0)
+
+    days_old = _safe_int(lead.get("days_old"), 999)
+    valuation = _safe_float(lead.get("valuation"))
     permit_type = (lead.get("permit_type") or "").lower()
     owner_name = lead.get("owner_name", "")
     owner_phone = lead.get("owner_phone", "")
     owner_email = lead.get("owner_email", "")
-    
+
     # Timing signals
     if days_old <= 3:
         score += 25
@@ -297,7 +393,7 @@ def compute_readiness(lead: dict) -> dict:
     elif days_old <= 14:
         score += 10
         signals.append("Filed within 2 weeks")
-    
+
     # Value signals
     if valuation >= 250000:
         score += 20
@@ -307,7 +403,7 @@ def compute_readiness(lead: dict) -> dict:
         signals.append(f"Medium-high value (${valuation:,.0f})")
     elif valuation >= 50000:
         score += 8
-    
+
     # Contact availability
     if owner_phone or owner_email:
         score += 15
@@ -315,7 +411,7 @@ def compute_readiness(lead: dict) -> dict:
     elif owner_name:
         score += 5
         signals.append("Owner identified — needs lookup")
-    
+
     # Permit type signals
     if any(t in permit_type for t in ["new construction", "addition", "remodel"]):
         score += 15
@@ -323,15 +419,14 @@ def compute_readiness(lead: dict) -> dict:
     elif any(t in permit_type for t in ["fire", "water", "insurance", "damage"]):
         score += 20
         signals.append("Insurance/damage — urgent need")
-    
-    # Check for LLC (skip trace opportunity)
+
+    # Corporate owner penalty
     if owner_name and any(t in owner_name.upper() for t in ["LLC", "INC", "CORP", "TRUST", "LP"]):
-        score -= 5  # Slightly harder to reach
+        score -= 5
         signals.append("Corporate owner — skip trace recommended")
-    
+
     readiness = min(100, score)
-    
-    # Determine action + urgency
+
     if readiness >= 80:
         action = "Call immediately — high readiness lead"
         urgency = "critical"
@@ -348,19 +443,17 @@ def compute_readiness(lead: dict) -> dict:
         action = "Monitor — low priority"
         urgency = "low"
         window = 30
-    
-    # Budget estimate (10-15% of valuation for GC services)
+
     budget_low = valuation * 0.10
     budget_high = valuation * 0.15
-    
-    # Competition estimate
+
     if days_old <= 3 and valuation >= 100000:
         competition = "high"
     elif days_old <= 7:
         competition = "medium"
     else:
         competition = "low"
-    
+
     return {
         "readiness_score": readiness,
         "recommended_action": action,
@@ -386,49 +479,41 @@ _INSURANCE_RE = re.compile(
 
 def is_insurance_claim(lead: dict) -> bool:
     """Detect if a lead is likely an insurance claim."""
-    desc = f"{lead.get('work_description', '')} {lead.get('description_full', '')} {lead.get('permit_type', '')}"
+    desc = (
+        f"{lead.get('work_description', '')} "
+        f"{lead.get('description_full', '')} "
+        f"{lead.get('permit_type', '')}"
+    )
     return bool(_INSURANCE_RE.search(desc))
 
 
 def score_breakdown(lead: dict) -> dict:
-    """Generate a detailed score breakdown for UI display."""
-    days_old = lead.get("days_old", 999)
-    valuation = lead.get("valuation", 0)
-    permit_type = lead.get("permit_type", "")
-    
-    breakdown = {
-        "total": lead.get("score", 0),
-        "components": [
-            {
-                "label": "Recency",
-                "value": max(0, 30 - days_old),
-                "max": 30,
-                "detail": f"{days_old} days old"
-            },
-            {
-                "label": "Project Value",
-                "value": min(20, int(valuation / 50000) * 2),
-                "max": 20,
-                "detail": f"${valuation:,.0f}"
-            },
-            {
-                "label": "Permit Type",
-                "value": 10 if any(t in (permit_type or "").lower() for t in ["construction", "remodel", "addition"]) else 5,
-                "max": 15,
-                "detail": permit_type or "Unknown"
-            },
-            {
-                "label": "Contact Info",
-                "value": (10 if lead.get("owner_phone") else 0) + (5 if lead.get("owner_email") else 0),
-                "max": 15,
-                "detail": "Available" if lead.get("owner_phone") or lead.get("owner_email") else "Missing"
-            },
-            {
-                "label": "Insurance Signal",
-                "value": 15 if is_insurance_claim(lead) else 0,
-                "max": 15,
-                "detail": "Detected" if is_insurance_claim(lead) else "None"
-            },
-        ]
+    """Generate a detailed score breakdown for UI display.
+    Delegates to calculate_score_v2 for consistency."""
+    _score, _temp, raw = calculate_score_v2(lead)
+
+    label_map = [
+        ("recency", "Recency"),
+        ("permit_type", "Permit Type"),
+        ("geography", "Geographic Quality"),
+        ("project_indicators", "Project Indicators"),
+        ("contact", "Contact Info"),
+        ("property_data", "Property Data"),
+        ("enrichment", "Enrichment Status"),
+        ("insurance", "Insurance Signal"),
+    ]
+
+    components = []
+    for key, label in label_map:
+        entry = raw.get(key, {})
+        components.append({
+            "label": label,
+            "value": entry.get("score", 0),
+            "max": entry.get("max", 0),
+            "detail": entry.get("detail", ""),
+        })
+
+    return {
+        "total": raw.get("total", lead.get("score", 0)),
+        "components": components,
     }
-    return breakdown

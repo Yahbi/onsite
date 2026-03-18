@@ -315,7 +315,7 @@
 <section class="stats">
     <div class="stats-inner">
         <div>
-            <div class="stat-num">3.8M+</div>
+            <div class="stat-num" id="stat-leads">800K+</div>
             <div class="stat-label">Active Permit Leads</div>
         </div>
         <div>
@@ -327,7 +327,7 @@
             <div class="stat-label">Data Refresh Cycle</div>
         </div>
         <div>
-            <div class="stat-num">90+</div>
+            <div class="stat-num" id="stat-sources">9,600+</div>
             <div class="stat-label">Data Sources</div>
         </div>
     </div>
@@ -415,7 +415,7 @@
             <div class="heatmap-blob b3"></div>
             <div class="heatmap-blob b4"></div>
             <div class="heatmap-overlay"></div>
-            <div class="heatmap-label">Los Angeles — 12,847 active permits</div>
+            <div class="heatmap-label" id="heatmap-label">Los Angeles — loading...</div>
         </div>
     </div>
 </section>
@@ -424,7 +424,7 @@
 <section class="coverage">
     <div class="section-label">Nationwide Coverage</div>
     <div class="section-title">All 50 States. Every Major Metro.</div>
-    <div class="section-subtitle">From LA to NYC, Miami to Seattle — we aggregate permits from 90+ government data sources so you never miss a lead.</div>
+    <div class="section-subtitle">From LA to NYC, Miami to Seattle — we aggregate permits from <span id="coverage-sources">9,600+</span> government data sources so you never miss a lead.</div>
     <div class="coverage-states">
         <span class="state-pill">California</span>
         <span class="state-pill">Texas</span>
@@ -455,7 +455,7 @@
     <div class="pricing-header">
         <div class="section-label">Pricing</div>
         <div class="section-title">Plans That Scale With You</div>
-        <div class="section-subtitle">Choose the plan that fits your operation. No contracts, cancel anytime.</div>
+        <div class="section-subtitle">Choose the plan that fits your operation.</div>
         <div class="pricing-toggle">
             <span id="bill-label-mo" class="active">Monthly</span>
             <div id="toggle-track" class="toggle-track" onclick="toggleBilling()"><div class="toggle-knob"></div></div>
@@ -514,7 +514,9 @@
             </ul>
             <a href="#" class="pricing-btn outline" onclick="startCheckout('enterprise');return false">Start Free Trial</a>
         </div>
-        <div class="pricing-card">
+    </div>
+    <div style="max-width:400px;margin:32px auto 0;text-align:center">
+        <div class="pricing-card" style="margin:0 auto">
             <div class="pricing-plan">Custom</div>
             <div class="pricing-price">Custom</div>
             <div class="pricing-desc">Tailored for your enterprise needs</div>
@@ -540,7 +542,7 @@
     <div id="faq-list">
         <div class="faq-item">
             <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">How fresh are the leads? <span class="faq-arrow">+</span></button>
-            <div class="faq-a">Our data pipeline syncs with 90+ government permit databases every 24 hours. Most leads appear within 1-2 days of the permit being filed.</div>
+            <div class="faq-a">Our data pipeline syncs with <span class="live-sources">9,600+</span> government permit databases every 24 hours. Most leads appear within 1-2 days of the permit being filed.</div>
         </div>
         <div class="faq-item">
             <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">What types of permits do you track? <span class="faq-arrow">+</span></button>
@@ -551,12 +553,12 @@
             <div class="faq-a">Owner names come from county assessor records and are highly accurate. Phone numbers are sourced from public records and have a ~70% hit rate. We're constantly improving enrichment coverage.</div>
         </div>
         <div class="faq-item">
-            <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">Can I cancel anytime? <span class="faq-arrow">+</span></button>
-            <div class="faq-a">Yes. No contracts, no commitments. Cancel from your dashboard in one click. Annual plans are billed upfront but can be prorated if you cancel early.</div>
+            <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">What is the cancellation policy? <span class="faq-arrow">+</span></button>
+            <div class="faq-a">All plans are bound by a service agreement for the selected billing period. Monthly plans renew automatically each month. Annual plans are billed upfront for the full year with no partial refunds. Contact support for questions about your contract.</div>
         </div>
         <div class="faq-item">
             <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">Do you cover my area? <span class="faq-arrow">+</span></button>
-            <div class="faq-a">We cover all 50 US states with 3.8M+ active leads. Coverage is strongest in major metros but we're adding rural counties every week. Start a free trial to check your zip codes.</div>
+            <div class="faq-a">We cover all 50 US states with <span class="live-leads">800K+</span> active leads. Coverage is strongest in major metros but we're adding rural counties every week. Start a free trial to check your zip codes.</div>
         </div>
     </div>
 </section>
@@ -693,6 +695,15 @@ function toggleBilling() {
     document.querySelectorAll('.price-yr').forEach(el => el.style.display = isAnnual ? '' : 'none');
 }
 
+function showLandingToast(msg, isError) {
+    const t = document.createElement('div');
+    t.style.cssText = 'position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:13px;font-weight:600;z-index:10000;transition:opacity .3s;' +
+        (isError ? 'background:#fef2f2;color:#991b1b;border:1px solid #fecaca' : 'background:#f0fdf4;color:#166534;border:1px solid #bbf7d0');
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 3000);
+}
+
 // Stripe Checkout flow
 async function startCheckout(plan) {
     // Check if user is logged in
@@ -725,12 +736,87 @@ async function startCheckout(plan) {
         if (data.checkout_url) {
             window.location.href = data.checkout_url;
         } else {
-            alert(data.detail || 'Unable to start checkout. Please try again.');
+            showLandingToast(data.detail || 'Unable to start checkout. Please try again.', true);
         }
     } catch (err) {
-        alert('Connection error. Please try again.');
+        showLandingToast('Connection error. Please try again.', true);
     }
 }
+
+// ── Load real stats from API ──
+(async function loadLiveStats() {
+    try {
+        const res = await fetch('/api/stats');
+        if (!res.ok) return;
+        const stats = await res.json();
+        
+        const totalLeads = stats.total_leads || stats.totalLeads || 0;
+        const hotLeads = stats.hot_leads || 0;
+        const warmLeads = stats.warm_leads || 0;
+        const sources = (stats.sources_active || stats.sources || 0);
+        
+        // Format numbers
+        function fmt(n) {
+            if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, '') + 'M+';
+            if (n >= 1000) return Math.floor(n / 1000).toLocaleString() + 'K+';
+            return n.toLocaleString();
+        }
+        
+        // Update stats bar
+        const elLeads = document.getElementById('stat-leads');
+        if (elLeads && totalLeads > 0) elLeads.textContent = fmt(totalLeads);
+        
+        const elSources = document.getElementById('stat-sources');
+        if (elSources && sources > 0) elSources.textContent = fmt(sources);
+        
+        // Update heatmap label with top city
+        const cities = stats.cities || {};
+        const topCity = Object.entries(cities).sort((a,b) => b[1] - a[1])[0];
+        const elHeatmap = document.getElementById('heatmap-label');
+        if (elHeatmap && topCity) {
+            elHeatmap.textContent = topCity[0] + ' \u2014 ' + topCity[1].toLocaleString() + ' active permits';
+        }
+        
+        // Update all live-sources spans
+        if (sources > 0) {
+            document.querySelectorAll('#coverage-sources, .live-sources').forEach(el => {
+                el.textContent = fmt(sources);
+            });
+        }
+        
+        // Update all live-leads spans
+        if (totalLeads > 0) {
+            document.querySelectorAll('.live-leads').forEach(el => {
+                el.textContent = fmt(totalLeads);
+            });
+        }
+    } catch (e) {
+        console.warn('[Onsite] Stats load error:', e);
+    }
+})();
+
+// Also load registry count for accurate source number
+(async function loadRegistryCount() {
+    try {
+        const res = await fetch('/api/data-sources');
+        if (!res.ok) return;
+        const data = await res.json();
+        const registry = data.registry || {};
+        const activeCount = registry.active || 0;
+        if (activeCount > 0) {
+            function fmt(n) {
+                if (n >= 1000) return Math.floor(n / 1000).toLocaleString() + 'K+';
+                return n.toLocaleString() + '+';
+            }
+            const formatted = fmt(activeCount);
+            const elSources = document.getElementById('stat-sources');
+            if (elSources) elSources.textContent = formatted;
+            document.querySelectorAll('#coverage-sources, .live-sources').forEach(el => {
+                el.textContent = formatted;
+            });
+        }
+    } catch (e) {}
+})();
 </script>
 </body>
 </html>

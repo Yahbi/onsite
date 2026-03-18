@@ -20,6 +20,7 @@ class EmailCampaignService:
         self.from_email = os.getenv("SENDGRID_FROM_EMAIL", "leads@onsite.com")
         self.from_name = os.getenv("SENDGRID_FROM_NAME", "Onsite")
         self.base_url = "https://api.sendgrid.com/v3"
+        self.app_url = os.getenv("ONSITE_APP_URL", "http://localhost:18000")
 
     async def send_single_email(
         self,
@@ -177,7 +178,7 @@ class EmailCampaignService:
                 </div>
 
                 <div style="text-align: center; margin-top: 30px;">
-                    <a href="http://localhost:18000" style="background: #667eea; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
+                    <a href="{self.app_url}" style="background: #667eea; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
                         View in Onsite
                     </a>
                 </div>
@@ -206,7 +207,7 @@ class EmailCampaignService:
         - Phone: {lead.get('owner_phone', 'Not available')}
         - Email: {lead.get('owner_email', 'Not available')}
 
-        View in Onsite: http://localhost:18000
+        View in Onsite: {self.app_url}
 
         This lead was automatically detected by Onsite.
         """
@@ -253,7 +254,7 @@ class EmailCampaignService:
                 {leads_html}
 
                 <div style="text-align: center; margin-top: 30px;">
-                    <a href="http://localhost:18000" style="background: #667eea; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
+                    <a href="{self.app_url}" style="background: #667eea; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
                         View All Leads
                     </a>
                 </div>
@@ -300,8 +301,48 @@ class EmailCampaignService:
         if not step_data:
             return {"success": False, "error": "Invalid campaign or step"}
 
-        # TODO: Load actual template from file
-        html_content = f"<p>Drip campaign step {step} for {lead_data.get('address')}</p>"
+        # Inline drip templates (step 1-3)
+        address = lead_data.get('address', 'your property')
+        owner = lead_data.get('owner_name', 'Homeowner')
+        permit_type = lead_data.get('permit_type', 'project')
+        drip_templates = {
+            1: f"""
+            <html><body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <div style="padding: 30px;">
+                <h2>Hi {owner},</h2>
+                <p>We noticed a <strong>{permit_type}</strong> permit was recently filed for
+                <strong>{address}</strong>.</p>
+                <p>We specialize in this type of work and would love to provide a free estimate.
+                Our team has completed hundreds of similar projects in your area.</p>
+                <p>Would you have 15 minutes for a quick call this week?</p>
+                <p>Best regards,<br/>The Onsite Team</p>
+              </div>
+            </body></html>""",
+            2: f"""
+            <html><body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <div style="padding: 30px;">
+                <h2>Hi {owner},</h2>
+                <p>Just following up on my earlier message about the {permit_type} project
+                at {address}.</p>
+                <p>I know things get busy — I just wanted to make sure you have the help
+                you need for this project. We offer free consultations and competitive pricing.</p>
+                <p>Feel free to reply to this email or give us a call anytime.</p>
+                <p>Best regards,<br/>The Onsite Team</p>
+              </div>
+            </body></html>""",
+            3: f"""
+            <html><body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <div style="padding: 30px;">
+                <h2>Hi {owner},</h2>
+                <p>This is my final follow-up regarding the {permit_type} work at {address}.</p>
+                <p>If you've already found a contractor, no worries at all! If you're still
+                looking, we'd be happy to help. Just reply to this email.</p>
+                <p>Wishing you all the best with your project!</p>
+                <p>Best regards,<br/>The Onsite Team</p>
+              </div>
+            </body></html>""",
+        }
+        html_content = drip_templates.get(step, f"<p>Drip step {step} for {address}</p>")
 
         return await self.send_single_email(
             to_email=recipient_email,

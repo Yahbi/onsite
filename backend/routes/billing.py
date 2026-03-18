@@ -12,7 +12,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 
-from backend.services.billing_webhook_handler import handle_event as stripe_handle_event
+from services.billing_webhook_handler import handle_event as stripe_handle_event
 
 logger = logging.getLogger(__name__)
 
@@ -96,16 +96,17 @@ def _extract_user_from_token(request: Request) -> tuple[str | None, str | None]:
 def get_user_plan(user_id: str) -> dict:
     """Get the active plan for a user. Returns FREE_PLAN if no subscription."""
     try:
-        conn = sqlite3.connect(_db_path(), timeout=10)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT plan FROM subscriptions WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-        if row and row[0] in STRIPE_PLANS:
-            return {**STRIPE_PLANS[row[0]], "plan_id": row[0]}
+        with sqlite3.connect(_db_path(), timeout=10) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT plan FROM subscriptions WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if row and row[0] in STRIPE_PLANS:
+                return {**STRIPE_PLANS[row[0]], "plan_id": row[0]}
         return {**FREE_PLAN, "plan_id": "free"}
     except Exception:
         return {**FREE_PLAN, "plan_id": "free"}
@@ -114,15 +115,16 @@ def get_user_plan(user_id: str) -> dict:
 def _get_stripe_customer_id(user_id: str) -> str | None:
     """Look up the Stripe customer ID for a user."""
     try:
-        conn = sqlite3.connect(_db_path(), timeout=10)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT stripe_customer_id FROM subscriptions WHERE user_id = ? AND stripe_customer_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-        return row[0] if row else None
+        with sqlite3.connect(_db_path(), timeout=10) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT stripe_customer_id FROM subscriptions WHERE user_id = ? AND stripe_customer_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
     except Exception:
         return None
 
@@ -262,7 +264,7 @@ async def create_billing_portal(request: Request):
 
 @router.post("/webhook")
 async def billing_webhook(request: Request):
-    """Handle Stripe webhook events with optional signature verification."""
+    """Handle Stripe webhook events with signature verification."""
     stripe_secret = os.getenv("STRIPE_WEBHOOK_SECRET", "")
     body = await request.body()
 
@@ -276,6 +278,5 @@ async def billing_webhook(request: Request):
             logger.error("Stripe webhook verification failed: %s", e)
             raise HTTPException(status_code=400, detail="Invalid signature")
     else:
-        # Dev mode: accept raw payload without signature verification
-        payload = json.loads(body)
-        return stripe_handle_event(payload)
+        logger.warning("Stripe webhook received but STRIPE_WEBHOOK_SECRET not configured — rejecting")
+        raise HTTPException(status_code=503, detail="Webhook signature verification not configured")

@@ -148,8 +148,22 @@ def normalize_socrata_record(
     state = str(mapped.get("state") or source.get("state", "")).strip()
 
     # Fall back to source location if city is missing or dirty
-    if not city or len(city) <= 1 or city.lower() in ("unknown", "n/a", "none"):
-        city = (source.get("location") or source.get("city") or "").split(" (")[0]
+    _JUNK_CITIES = {
+        "unknown", "n/a", "none", "data", "www", "opendata", "lacity",
+        "mbridgema", "cityofchigo", "cityofchicago", "cityofnewyork",
+        "sfgov", "nola", "austintexas", "houstontx",
+    }
+    if not city or len(city) <= 1 or city.lower() in _JUNK_CITIES:
+        fallback = (source.get("location") or source.get("city") or "").split(" (")[0]
+        # Only use fallback if it's not also junk
+        if fallback and fallback.lower() not in _JUNK_CITIES and len(fallback) >= 2:
+            city = fallback
+        else:
+            city = ""
+
+    # Normalize case: "AUSTIN" -> "Austin", "los angeles" -> "Los Angeles"
+    if city and (city.isupper() or city.islower()) and len(city) > 2:
+        city = city.title()
 
     zipcode = str(mapped.get("zip", ""))[:5]
 
@@ -168,14 +182,11 @@ def normalize_socrata_record(
     lat = _safe_float(mapped.get("lat"))
     lng = _safe_float(mapped.get("lng"))
 
-    # Fallback geocode: hash-based scatter around source center
+    # No hash-based fallback — leads without real coords get NULL lat/lng
+    # Map endpoint filters out NULL coordinates automatically
     if not lat or not lng or lat == 0 or lng == 0:
-        import hashlib
-        src_lat = _safe_float(source.get("lat")) or 39.5
-        src_lng = _safe_float(source.get("lng")) or -98.5
-        h = int(hashlib.md5((addr + permit_number).encode()).hexdigest()[:8], 16)
-        lat = src_lat + (h % 1000 - 500) * 0.0001
-        lng = src_lng + ((h >> 10) % 1000 - 500) * 0.0001
+        lat = None
+        lng = None
 
     # Score
     score, temp, urgency = 50, "Warm", "Medium"

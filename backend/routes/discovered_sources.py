@@ -24,7 +24,7 @@ async def list_discovered_sources(
     Search discovered permit API endpoints.
     Returns sources from the master discovery CSV (2,300+ validated endpoints).
     """
-    from backend.services.discovered_sources import get_discovered_registry
+    from services.discovered_sources import get_discovered_registry
 
     registry = get_discovered_registry()
     results = registry.search(city=city, state=state, location_type=location_type)
@@ -46,7 +46,7 @@ async def list_discovered_sources(
 @router.get("/stats")
 async def discovered_sources_stats():
     """Get summary statistics for discovered sources."""
-    from backend.services.discovered_sources import get_discovered_registry
+    from services.discovered_sources import get_discovered_registry
 
     registry = get_discovered_registry()
     return registry.get_stats()
@@ -60,7 +60,7 @@ async def coverage_by_state(
     Get permit API coverage by state.
     Shows how many cities/counties in each state have discovered APIs.
     """
-    from backend.services.discovered_sources import get_discovered_registry
+    from services.discovered_sources import get_discovered_registry
 
     registry = get_discovered_registry()
 
@@ -92,7 +92,7 @@ async def get_sync_ready_sources():
     Get sources that are ready to be integrated into the sync pipeline.
     Returns counts and sample of new Socrata/ArcGIS sources not yet in config.
     """
-    from backend.services.discovered_sources import get_discovered_registry
+    from services.discovered_sources import get_discovered_registry
 
     registry = get_discovered_registry()
 

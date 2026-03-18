@@ -4,6 +4,7 @@ Handles Google sign-in, callback, and account linking.
 """
 
 import os
+import time
 import uuid
 import logging
 import sqlite3
@@ -24,6 +25,12 @@ GOOGLE_REDIRECT_URI = os.getenv(
     "http://localhost:18000/api/auth/google/callback",
 )
 APP_URL = os.getenv("APP_URL", "http://localhost:18000")
+
+# Short-lived auth codes: {code: {"token": jwt, "expires": timestamp}}
+# Exchanged once via POST, avoids leaking JWTs in redirect URLs.
+_pending_auth_codes: dict[str, dict] = {}
+
+AUTH_CODE_TTL_SECONDS = 60
 
 # Lazy-init OAuth client (only if credentials are configured)
 _oauth = None
@@ -68,9 +75,9 @@ def _connect():
 def _create_token(user_id: str, email: str, role: str = "user") -> str:
     """Import and delegate to auth module's token creator."""
     try:
-        from backend.routes.auth import _create_token as auth_create_token
-    except ImportError:
         from routes.auth import _create_token as auth_create_token
+    except ImportError:
+        raise ImportError("Cannot import _create_token from routes.auth")
     return auth_create_token(user_id, email, role)
 
 
@@ -184,12 +191,57 @@ async def google_callback(request: Request):
         # Issue JWT
         jwt_token = _create_token(user_id, email, user_role)
 
-        # Redirect to app with token (the frontend will pick it up)
-        response = RedirectResponse(f"{APP_URL}/login?auth=google&token={jwt_token}")
-        return response
+        # Store JWT behind a short-lived auth code (never expose JWT in URL)
+        auth_code = str(uuid.uuid4())
+        _pending_auth_codes[auth_code] = {
+            "token": jwt_token,
+            "expires": time.time() + AUTH_CODE_TTL_SECONDS,
+        }
+
+        # Redirect to app with opaque code (frontend exchanges via POST)
+        return RedirectResponse(f"{APP_URL}/login?auth=google&code={auth_code}")
 
     except Exception as exc:
         logger.error("Google OAuth DB error: %s", exc)
         return RedirectResponse(f"{APP_URL}/login?error=server_error")
     finally:
         conn.close()
+
+
+def _purge_expired_codes() -> None:
+    """Remove expired auth codes, returning a clean dict."""
+    global _pending_auth_codes
+    now = time.time()
+    _pending_auth_codes = {
+        code: entry
+        for code, entry in _pending_auth_codes.items()
+        if entry["expires"] > now
+    }
+
+
+@router.post("/google/exchange")
+async def google_exchange(request: Request):
+    """Exchange a short-lived auth code for the JWT token."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON body"}, status_code=400)
+
+    code = body.get("code", "").strip()
+    if not code:
+        return JSONResponse({"detail": "Missing code"}, status_code=400)
+
+    # Purge expired codes before lookup
+    _purge_expired_codes()
+
+    entry = _pending_auth_codes.get(code)
+    if not entry:
+        return JSONResponse({"detail": "Invalid or expired code"}, status_code=401)
+
+    # One-time use: remove immediately
+    _pending_auth_codes.pop(code, None)
+
+    if entry["expires"] < time.time():
+        return JSONResponse({"detail": "Code expired"}, status_code=401)
+
+    return JSONResponse({"token": entry["token"]})

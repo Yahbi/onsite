@@ -20,12 +20,26 @@ logger = logging.getLogger(__name__)
 
 
 def ensure_query_url(url: str) -> str:
-    """Ensure an ArcGIS URL ends with /query for the REST API."""
+    """Ensure an ArcGIS URL ends with /LayerIndex/query for the REST API.
+
+    Many ArcGIS URLs point to FeatureServer or MapServer without a layer index.
+    Without a layer index, ArcGIS returns service metadata, not features.
+    Default to layer 0 when no index is specified.
+    """
     url = url.strip().rstrip("/")
+    # Already has /query — leave as-is
     if url.endswith("/query"):
         return url
-    if re.search(r"/(Feature|Map)Server(/\d+)?$", url):
+    # Strip existing query params that got baked into the URL
+    if "?" in url:
+        url = url.split("?")[0].rstrip("/")
+    # Has FeatureServer/MapServer with layer index already (e.g., /FeatureServer/0)
+    if re.search(r"/(Feature|Map)Server/\d+$", url):
         return url + "/query"
+    # Has FeatureServer/MapServer but NO layer index — default to layer 0
+    if re.search(r"/(Feature|Map)Server$", url):
+        return url + "/0/query"
+    # Unknown format — try appending /query
     return url + "/query"
 
 
@@ -77,7 +91,9 @@ async def fetch_arcgis(
                         raise RuntimeError(f"ArcGIS {label}: {err_msg}")
                     features = data.get("features", [])
                     logger.info(f"ArcGIS {label}: {len(features)} features")
-                    return features
+                    # Flatten features: merge attributes + geometry into flat dicts
+                    # so extract_address/extract_permit_number in main.py can find fields
+                    return [_flatten_feature(f) for f in features]
                 elif resp.status == 403:
                     raise PermissionError(f"ArcGIS {label} HTTP 403 Forbidden")
                 else:
@@ -128,7 +144,7 @@ async def fetch_arcgis_paginated(
                     features = data.get("features", [])
                     if not features:
                         break
-                    all_features.extend(features)
+                    all_features.extend(_flatten_feature(f) for f in features)
                     offset += len(features)
                     if len(features) < page_size:
                         break
@@ -215,6 +231,24 @@ def normalize_arcgis_record(
         "stage": "new",
         "enrichment_status": "pending",
     }
+
+
+def _flatten_feature(feature: dict) -> dict:
+    """Flatten an ArcGIS feature {attributes: {...}, geometry: {x, y}} into a flat dict.
+
+    This allows extract_address() and other field extractors in main.py
+    to find fields like 'address', 'permit_number' etc. directly.
+    """
+    attrs = feature.get("attributes") or {}
+    geo = feature.get("geometry") or {}
+    flat = dict(attrs)
+    # Map ArcGIS geometry x/y to lat/lng
+    if "y" in geo and "x" in geo:
+        flat.setdefault("lat", geo["y"])
+        flat.setdefault("lng", geo["x"])
+        flat.setdefault("longitude", geo["x"])
+        flat.setdefault("latitude", geo["y"])
+    return flat
 
 
 def _safe_float(val: Any) -> Optional[float]:

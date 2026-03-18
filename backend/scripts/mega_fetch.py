@@ -408,7 +408,7 @@ async def fetch_arcgis(session, url, state, desc, sem, max_records=50000):
                                     if -90 <= lat <= 90 and -180 <= lng <= 180:
                                         attrs["latitude"] = lat
                                         attrs["longitude"] = lng
-                                except:
+                                except Exception:
                                     pass
                         lead = normalize_lead(attrs, state, f"arcgis_{desc.replace(' ', '_')}")
                         if lead:
@@ -453,7 +453,7 @@ async def discover_socrata(session, query, sem, fetched):
                     continue
                 batch = await fetch_socrata(session, rid, domain, state, name, sem)
                 leads.extend(batch)
-    except:
+    except Exception:
         pass
     return leads
 

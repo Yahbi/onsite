@@ -12,11 +12,13 @@ import logging
 import time
 from typing import Optional
 
+import os
+
 import httpx
 
 logger = logging.getLogger(__name__)
 
-API_KEY = "efa28b4b-7cf6-4dab-ae39-9a2f9c61dbf7"
+API_KEY = os.getenv("CLOUDMERSIVE_API_KEY", "")
 BASE_URL = "https://api.cloudmersive.com"
 
 _cache: dict[str, dict] = {}

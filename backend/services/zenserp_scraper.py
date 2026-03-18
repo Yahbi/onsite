@@ -18,11 +18,13 @@ import re
 import time
 from typing import Optional
 
+import os
+
 import httpx
 
 logger = logging.getLogger(__name__)
 
-API_KEY = "39db36b0-1cd4-11f1-9d1d-930ea230f5a5"
+API_KEY = os.getenv("ZENSERP_API_KEY", "")
 BASE_URL = "https://app.zenserp.com/api/v2/search"
 
 _cache: dict[str, dict] = {}

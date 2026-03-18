@@ -172,7 +172,7 @@ def normalize_lead(raw, state, source):
                     from datetime import datetime
                     ts = int(val) / 1000
                     lead["issue_date"] = datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
-                except:
+                except (ValueError, TypeError, OSError):
                     lead["issue_date"] = val
             else:
                 lead["issue_date"] = val
@@ -186,7 +186,7 @@ def normalize_lead(raw, state, source):
                 if -90 <= lat <= 90 and lat != 0:
                     lead["latitude"] = lat
                     break
-            except:
+            except (ValueError, TypeError):
                 pass
 
     for lk in ["longitude", "lng", "lon", "x", "LONGITUDE", "LNG", "LON", "X", "Longitude", "POINT_X"]:
@@ -196,7 +196,7 @@ def normalize_lead(raw, state, source):
                 if -180 <= lng <= 180 and lng != 0:
                     lead["longitude"] = lng
                     break
-            except:
+            except (ValueError, TypeError):
                 pass
 
     # City center fallback
@@ -250,7 +250,7 @@ async def fetch_arcgis(session, url, state, desc, sem, max_recs=200000):
                                     if -90 <= lat <= 90 and -180 <= lng <= 180:
                                         attrs["latitude"] = lat
                                         attrs["longitude"] = lng
-                                except:
+                                except Exception:
                                     pass
                         lead = normalize_lead(attrs, state, f"arcgis_{desc.replace(' ', '_')}")
                         if lead:

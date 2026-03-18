@@ -212,7 +212,8 @@ class FreeEmailFinder:
             try:
                 mx_records = dns.resolver.resolve(domain, 'MX')
                 mx_host = str(mx_records[0].exchange).rstrip('.')
-            except:
+            except Exception as e:
+                logger.debug("MX lookup failed for %s: %s", domain, e)
                 # Fallback: try domain directly
                 mx_host = domain
 

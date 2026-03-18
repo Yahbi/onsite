@@ -13,11 +13,13 @@ import re
 import time
 from typing import Optional
 
+import os
+
 import httpx
 
 logger = logging.getLogger(__name__)
 
-API_KEY = "13EAF1DB4B5A4BAC878BBA00481E0B5E"
+API_KEY = os.getenv("VERIPHONE_API_KEY", "")
 BASE_URL = "https://api.veriphone.io/v2/verify"
 
 _cache: dict[str, dict] = {}

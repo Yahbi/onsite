@@ -1,30 +1,28 @@
 """
 Enrichment Orchestrator — chains ALL free sources to find owner phone + email.
 
-Pipeline order (fastest + highest hit-rate first):
-1. ThatsThem reverse address (best — we always have the property address)
-2. USSearch name search (proven — good phone hit rate)
-3. ThatsThem name search (fallback — un-obfuscated emails)
-4. VoterRecords (supplementary — best in FL, CO, WA, NC, OH, OR, PA)
-5. Zenserp Google SERP (searches Google for phone/email)
-6. Nuwber reverse address + name (118M addresses, 305M emails)
-7. SearchPeopleFree (unlimited free, phone + email)
-8. SpyDialer (free reverse address/name, voicemail feature)
-9. TruePeopleSearch + FastPeopleSearch (parallel, heavy Cloudflare)
-10. OpenCorporates LLC resolution (entity owners → real person name)
+Pipeline order (optimized for throughput with parallel groups):
+0. Regrid parcel data (owner name, property data) — sequential, provides owner_name
+Then in PARALLEL:
+  Group A (address-based): ThatsThem-address, Nuwber-address, SpyDialer-address
+  Group B (name-based): USSearch, ThatsThem-name, VoterRecords, Nuwber-name,
+                         SearchPeopleFree, Zenserp, TruePeopleSearch, FastPeopleSearch
+10. FreeEmailFinder (SMTP verification)
 Post-enrichment: 3-way phone validation + email validation
 
 Key design principles:
-- Stop early: once we have BOTH phone AND email, skip remaining sources
+- Parallel source groups: address-based and name-based run concurrently
+- 10s per-source timeout prevents single slow source from blocking pipeline
 - Concurrent batch processing with configurable semaphore
 - All results cached 7 days per source
 - Rate-limited per source to avoid blocks
-- Reuse aiohttp sessions across batch (not per-lead)
 - Returns NEW dict, never mutates input leads
 """
 
 import asyncio
+import re
 import logging
+import os
 import time
 from typing import Optional
 
@@ -44,12 +42,14 @@ _nuwber = None
 _searchpeoplefree = None
 _spydialer = None
 _contact_scraper = None
+_regrid_service = None
 
 
 def _load_sources():
     global _thatsthem, _ussearch, _truepeoplesearch, _fastpeoplesearch
     global _voterrecords, _zenserp, _phone_intel, _cloudmersive, _veriphone
     global _nuwber, _searchpeoplefree, _spydialer, _contact_scraper
+    global _regrid_service
     if _thatsthem is None:
         from services import thatsthem_scraper as _tt
         from services import truepeoplesearch_scraper as _tps
@@ -75,6 +75,19 @@ def _load_sources():
         _searchpeoplefree = _spf
         _spydialer = _sd
         _contact_scraper = _cs
+    if _regrid_service is None:
+        regrid_enabled = os.getenv("REGRID_ENABLED", "0") == "1"
+        regrid_key = os.getenv("REGRID_API_KEY", "")
+        if regrid_enabled and regrid_key:
+            try:
+                from services.parcel_service import RegridParcelService
+                _regrid_service = RegridParcelService(api_key=regrid_key)
+                logger.info("Regrid parcel service initialized (nationwide)")
+            except Exception as e:
+                logger.warning("Failed to initialize Regrid: %s", e)
+                _regrid_service = None
+        else:
+            logger.info("Regrid disabled (REGRID_ENABLED=%s)", os.getenv("REGRID_ENABLED", "0"))
 
 
 def _is_llc(name: str) -> bool:
@@ -88,6 +101,31 @@ def _is_llc(name: str) -> bool:
         ' ESTATE', ' FUND',
     )
     return any(p in upper for p in patterns)
+
+
+
+def _validate_phone(phone: str) -> bool:
+    """Check if phone looks real (10+ digits, not a known junk number)."""
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if len(digits) < 10:
+        return False
+    # Known junk patterns
+    if digits.startswith("000") or digits == "0" * 10:
+        return False
+    return True
+
+
+def _validate_email(email: str) -> bool:
+    """Check if email looks real (not a scraper own email)."""
+    if not email or "@" not in email:
+        return False
+    junk_domains = [
+        "thatsthem.com", "spokeo.com", "nuwber.com", "searchpeoplefree.com",
+        "truepeoplesearch.com", "fastpeoplesearch.com", "spydialer.com",
+        "example.com", "test.com",
+    ]
+    domain = email.split("@")[1].lower()
+    return domain not in junk_domains
 
 
 async def enrich_single(
@@ -143,7 +181,7 @@ async def enrich_single(
                     search_name = person
                     logger.debug(f"LLC {owner_name} → {person}")
         except Exception as e:
-            logger.debug(f"LLC resolve error: {e}")
+            logger.warning(f"LLC resolve error: {e}")
 
     def _merge(source_result: Optional[dict]):
         """Merge a source result into the accumulated result."""
@@ -152,171 +190,155 @@ async def enrich_single(
             return False
 
         hit = False
-        if need_phone and source_result.get("phone"):
+        if need_phone and source_result.get("phone") and _validate_phone(source_result["phone"]):
             result["phone"] = source_result["phone"]
             need_phone = False
             hit = True
             for p in source_result.get("phones", [source_result["phone"]]):
-                if p and p not in result["phones"]:
+                if p and _validate_phone(p) and p not in result["phones"]:
                     result["phones"].append(p)
 
-        if need_email and source_result.get("email"):
+        if need_email and source_result.get("email") and _validate_email(source_result["email"]):
             result["email"] = source_result["email"]
             need_email = False
             hit = True
             for e in source_result.get("emails", [source_result["email"]]):
-                if e and e not in result["emails"]:
+                if e and _validate_email(e) and e not in result["emails"]:
                     result["emails"].append(e)
 
         # Collect additional phones/emails even if we already have primary
         for p in source_result.get("phones", []):
-            if p and p not in result["phones"]:
+            if p and _validate_phone(p) and p not in result["phones"]:
                 result["phones"].append(p)
         for e in source_result.get("emails", []):
-            if e and e not in result["emails"]:
+            if e and _validate_email(e) and e not in result["emails"]:
                 result["emails"].append(e)
 
         return hit
 
-    # ── Source 1: ThatsThem reverse address (highest value) ──
+    # ── Source 0: Regrid parcel data (owner name, mailing address, property data) ──
+    # Runs first to populate owner_name which all other scrapers need.
+    regrid_enrichment = {}
+    if _regrid_service and _regrid_service.api_key and address:
+        result["sources_tried"].append("Regrid")
+        try:
+            regrid_enrichment = await _regrid_service.enrich_lead(lead)
+            if regrid_enrichment:
+                result["sources_hit"].append("Regrid")
+                # If Regrid found an owner name and we didn't have one, use it
+                if regrid_enrichment.get("owner_name") and not owner_name:
+                    owner_name = regrid_enrichment["owner_name"]
+                    search_name = owner_name
+                    if _is_llc(owner_name):
+                        try:
+                            llc_result = await _contact_scraper.resolve_llc_owner(owner_name, state)
+                            if llc_result:
+                                person = llc_result.get("person_name") or llc_result.get("agent_name") or ""
+                                if person:
+                                    result["person_name"] = person
+                                    search_name = person
+                        except Exception:
+                            pass
+                logger.debug(f"Regrid enriched: {regrid_enrichment.keys()}")
+        except Exception as e:
+            logger.warning(f"Regrid enrichment error: {e}")
+
+    # Attach Regrid property data to result for caller to persist
+    result["regrid_data"] = regrid_enrichment
+
+    # ── Parallel enrichment groups ──
+    # All sources run concurrently with per-source timeouts.
+    # Group A: address-based (no name needed)
+    # Group B: name-based (needs search_name from Regrid or input)
+
+    async def _safe(coro, source_name):
+        """Run a source safely, return (source_name, result) or None on error."""
+        try:
+            r = await asyncio.wait_for(coro, timeout=10)
+            return (source_name, r)
+        except asyncio.TimeoutError:
+            logger.debug(f"{source_name} timeout")
+            return None
+        except Exception as e:
+            logger.warning(f"{source_name} error: {e}")
+            return None
+
+    tasks = []
+    task_names = []
+
+    # Group A: Address-based (always available if we have an address)
     if address and (need_phone or need_email):
-        result["sources_tried"].append("ThatsThem-address")
-        try:
-            r = await _thatsthem.reverse_address_lookup(address, city, state)
-            if _merge(r):
-                result["sources_hit"].append("ThatsThem-address")
-        except Exception as e:
-            logger.debug(f"ThatsThem address error: {e}")
+        tasks.append(_safe(_thatsthem.reverse_address_lookup(address, city, state), "ThatsThem-address"))
+        task_names.append("ThatsThem-address")
+        tasks.append(_safe(_nuwber.search_by_address(address, city, state), "Nuwber-address"))
+        task_names.append("Nuwber-address")
+        tasks.append(_safe(_spydialer.reverse_address(address, city, state), "SpyDialer-address"))
+        task_names.append("SpyDialer-address")
 
-    # ── Source 2: USSearch name (proven for phones) ──
+    # Group B: Name-based (needs search_name)
     if search_name and (need_phone or need_email):
-        result["sources_tried"].append("USSearch")
-        try:
-            r = await _contact_scraper.scrape_ussearch(search_name, city, state)
-            if _merge(r):
-                result["sources_hit"].append("USSearch")
-        except Exception as e:
-            logger.debug(f"USSearch error: {e}")
+        tasks.append(_safe(_contact_scraper.scrape_ussearch(search_name, city, state), "USSearch"))
+        task_names.append("USSearch")
+        tasks.append(_safe(_thatsthem.name_search(search_name, city, state), "ThatsThem-name"))
+        task_names.append("ThatsThem-name")
+        tasks.append(_safe(_voterrecords.search(search_name, city, state), "VoterRecords"))
+        task_names.append("VoterRecords")
+        tasks.append(_safe(_nuwber.search_by_name(search_name, city, state), "Nuwber-name"))
+        task_names.append("Nuwber-name")
+        tasks.append(_safe(_searchpeoplefree.search(search_name, city, state), "SearchPeopleFree"))
+        task_names.append("SearchPeopleFree")
+        if _zenserp and getattr(_zenserp, "API_KEY", ""):
+            tasks.append(_safe(_zenserp.search_owner(search_name, city, state, address), "Zenserp"))
+            task_names.append("Zenserp")
+        if not skip_slow:
+            tasks.append(_safe(_truepeoplesearch.search(search_name, city, state), "TruePeopleSearch"))
+            task_names.append("TruePeopleSearch")
+            tasks.append(_safe(_fastpeoplesearch.search(search_name, city, state), "FastPeopleSearch"))
+            task_names.append("FastPeopleSearch")
 
-    # ── Source 3: ThatsThem name search ──
-    if search_name and (need_phone or need_email):
-        result["sources_tried"].append("ThatsThem-name")
-        try:
-            r = await _thatsthem.name_search(search_name, city, state)
-            if _merge(r):
-                result["sources_hit"].append("ThatsThem-name")
-        except Exception as e:
-            logger.debug(f"ThatsThem name error: {e}")
+    # Track all sources we're trying
+    result["sources_tried"].extend(task_names)
 
-    # Early exit if we have both
-    if not need_phone and not need_email:
-        return result
+    # Run ALL sources in parallel
+    if tasks:
+        raw_results = await asyncio.gather(*tasks)
+        for r in raw_results:
+            if r is not None:
+                source_name, source_result = r
+                if _merge(source_result):
+                    result["sources_hit"].append(source_name)
 
-    # ── Source 4: VoterRecords (best for FL, CO, WA, NC, OH, OR, PA) ──
-    if search_name and (need_phone or need_email):
-        result["sources_tried"].append("VoterRecords")
-        try:
-            r = await _voterrecords.search(search_name, city, state)
-            if _merge(r):
-                result["sources_hit"].append("VoterRecords")
-        except Exception as e:
-            logger.debug(f"VoterRecords error: {e}")
-
-    if not need_phone and not need_email:
-        return result
-
-    # ── Source 5: Zenserp Google SERP (searches Google for contact info) ──
-    if search_name and (need_phone or need_email):
-        result["sources_tried"].append("Zenserp")
-        try:
-            r = await _zenserp.search_owner(search_name, city, state, address)
-            if _merge(r):
-                result["sources_hit"].append("Zenserp")
-        except Exception as e:
-            logger.debug(f"Zenserp error: {e}")
-
-    if not need_phone and not need_email:
-        return result
-
-    # ── Source 6: Nuwber (118M addresses, 305M emails) ──
-    if address and (need_phone or need_email):
-        result["sources_tried"].append("Nuwber-address")
-        try:
-            r = await _nuwber.search_by_address(address, city, state)
-            if _merge(r):
-                result["sources_hit"].append("Nuwber-address")
-        except Exception as e:
-            logger.debug(f"Nuwber address error: {e}")
-
-    if search_name and (need_phone or need_email):
-        result["sources_tried"].append("Nuwber-name")
-        try:
-            r = await _nuwber.search_by_name(search_name, city, state)
-            if _merge(r):
-                result["sources_hit"].append("Nuwber-name")
-        except Exception as e:
-            logger.debug(f"Nuwber name error: {e}")
-
-    if not need_phone and not need_email:
-        return result
-
-    # ── Source 7: SearchPeopleFree (unlimited free) ──
-    if search_name and (need_phone or need_email):
-        result["sources_tried"].append("SearchPeopleFree")
-        try:
-            r = await _searchpeoplefree.search(search_name, city, state)
-            if _merge(r):
-                result["sources_hit"].append("SearchPeopleFree")
-        except Exception as e:
-            logger.debug(f"SearchPeopleFree error: {e}")
-
-    if not need_phone and not need_email:
-        return result
-
-    # ── Source 8: SpyDialer (free reverse address/name) ──
-    if address and (need_phone or need_email):
-        result["sources_tried"].append("SpyDialer")
-        try:
-            r = await _spydialer.reverse_address(address, city, state)
-            if _merge(r):
-                result["sources_hit"].append("SpyDialer-address")
-        except Exception as e:
-            logger.debug(f"SpyDialer error: {e}")
-
-    if search_name and not result.get("phone") and (need_phone or need_email):
-        try:
-            r = await _spydialer.search_by_name(search_name, city, state)
-            if _merge(r):
-                result["sources_hit"].append("SpyDialer-name")
-        except Exception as e:
-            logger.debug(f"SpyDialer name error: {e}")
-
-    if not need_phone and not need_email:
-        return result
-
-    # ── Source 9: TruePeopleSearch + FastPeopleSearch (parallel, heavy CF) ──
-    if not skip_slow and search_name and (need_phone or need_email):
-        result["sources_tried"].extend(["TruePeopleSearch", "FastPeopleSearch"])
-        try:
-            tps_task = _truepeoplesearch.search(search_name, city, state)
-            fps_task = _fastpeoplesearch.search(search_name, city, state)
-            tps_r, fps_r = await asyncio.gather(tps_task, fps_task, return_exceptions=True)
-
-            if not isinstance(tps_r, Exception) and _merge(tps_r):
-                result["sources_hit"].append("TruePeopleSearch")
-            if not isinstance(fps_r, Exception) and _merge(fps_r):
-                result["sources_hit"].append("FastPeopleSearch")
-        except Exception as e:
-            logger.debug(f"PeopleSearch error: {e}")
-
-    # If LLC and USSearch didn't work with resolved person, try original LLC name
+    # LLC fallback — try original LLC name if resolved person didn't work
     if (need_phone or need_email) and search_name != owner_name and owner_name:
-        try:
-            r = await _contact_scraper.scrape_ussearch(owner_name, city, state)
-            if _merge(r):
+        r = await _safe(_contact_scraper.scrape_ussearch(owner_name, city, state), "USSearch-llc")
+        if r:
+            _, sr = r
+            if _merge(sr):
                 result["sources_hit"].append("USSearch-llc")
+
+    # ── Step 10: Free email finder (SMTP verification) ──
+    if not result.get("email") and search_name and lead.get("city"):
+        result["sources_tried"].append("FreeEmailFinder")
+        try:
+            from services.free_enrichment import FreeEmailFinder
+            finder = FreeEmailFinder()
+            name_parts = search_name.strip().split()
+            if len(name_parts) >= 2:
+                _first = name_parts[0]
+                _last = name_parts[-1]
+                fe_result = await asyncio.wait_for(
+                    finder.find_email(_first, _last),
+                    timeout=8,
+                )
+                if fe_result and fe_result.get("email"):
+                    _merge({"email": fe_result["email"], "emails": [fe_result["email"]]})
+                    result["sources_hit"].append("FreeEmailFinder")
+                    need_email = False
+                    logger.info("FreeEmailFinder found email for %s", search_name)
+        except asyncio.TimeoutError:
+            logger.debug("FreeEmailFinder timeout for %s", search_name)
         except Exception as e:
-            logger.debug(f"USSearch LLC fallback error: {e}")
+            logger.warning("FreeEmailFinder error: %s", e)
 
     # ── Phone Validation: Abstract + Veriphone + Cloudmersive (parallel) ──
     if result.get("phone"):
@@ -324,9 +346,12 @@ async def enrich_single(
             abstract_task = _phone_intel.lookup(result["phone"])
             veriphone_task = _veriphone.verify(result["phone"])
             cloudm_task = _cloudmersive.validate_phone(result["phone"])
-            abs_r, veri_r, cm_r = await asyncio.gather(
-                abstract_task, veriphone_task, cloudm_task,
-                return_exceptions=True,
+            abs_r, veri_r, cm_r = await asyncio.wait_for(
+                asyncio.gather(
+                    abstract_task, veriphone_task, cloudm_task,
+                    return_exceptions=True,
+                ),
+                timeout=8,
             )
 
             intel = abs_r if not isinstance(abs_r, Exception) else None
@@ -351,7 +376,6 @@ async def enrich_single(
                 total_votes += 1
                 if veri.get("valid"):
                     valid_votes += 1
-                # Veriphone has better carrier/type detection
                 phone_meta["carrier"] = veri.get("carrier", "")
                 phone_meta["line_type"] = veri.get("phone_type", "")
                 phone_meta["region"] = veri.get("region", "")
@@ -380,8 +404,10 @@ async def enrich_single(
                         break
 
             result["sources_hit"].append("PhoneValidation")
+        except asyncio.TimeoutError:
+            logger.debug("Phone validation timeout for %s", result["phone"])
         except Exception as e:
-            logger.debug(f"Phone validation error: {e}")
+            logger.warning(f"Phone validation error: {e}")
 
     # ── Email Validation: Cloudmersive full check ──
     if result.get("email"):
@@ -390,7 +416,6 @@ async def enrich_single(
             if ev:
                 result["email_valid"] = ev.get("valid", False)
                 result["email_disposable"] = ev.get("is_disposable", False)
-                # If email is invalid/disposable, try alternates
                 if not ev.get("valid") or ev.get("is_disposable"):
                     for alt_email in result.get("emails", [])[1:]:
                         alt_ev = await _cloudmersive.validate_email(alt_email)
@@ -402,7 +427,7 @@ async def enrich_single(
                             break
                 result["sources_hit"].append("EmailValidation")
         except Exception as e:
-            logger.debug(f"Email validation error: {e}")
+            logger.warning(f"Email validation error: {e}")
 
     return result
 
@@ -410,7 +435,7 @@ async def enrich_single(
 async def enrich_batch(
     leads: list[dict],
     max_leads: int = 1000,
-    concurrency: int = 5,
+    concurrency: int = 10,
     skip_slow: bool = True,
 ) -> dict:
     """
@@ -419,7 +444,7 @@ async def enrich_batch(
     Args:
         leads: List of lead dicts
         max_leads: Max leads to process
-        concurrency: Concurrent workers
+        concurrency: Concurrent workers (default 10 for high throughput)
         skip_slow: Skip Cloudflare-heavy sources (TruePeople, FastPeople)
 
     Returns:
@@ -428,14 +453,16 @@ async def enrich_batch(
     t0 = time.time()
 
     candidates = []
+    skip_names = ("not found", "unknown", "n/a", "pending lookup")
     for lead in leads:
         owner = str(lead.get("owner_name", "") or "").strip()
-        if not owner or owner.lower() in ("not found", "unknown", "n/a"):
-            continue
         phone = str(lead.get("owner_phone", "") or "").strip()
         email = str(lead.get("owner_email", "") or "").strip()
         if phone and email:
             continue
+        if owner.lower() in skip_names:
+            owner = ""
+            lead["owner_name"] = ""
         candidates.append(lead)
 
     if not candidates:
@@ -477,13 +504,31 @@ async def enrich_batch(
                 lead["beneficial_owner"] = enrichment["person_name"]
                 updated = True
 
+            # Persist Regrid parcel data back to lead
+            regrid = enrichment.get("regrid_data") or {}
+            for rk, lk in (
+                ("owner_name", "owner_name"),
+                ("market_value", "market_value"),
+                ("year_built", "year_built"),
+                ("square_feet", "square_feet"),
+                ("lot_size", "lot_size"),
+                ("bedrooms", "bedrooms"),
+                ("bathrooms", "bathrooms"),
+                ("zoning", "zoning"),
+                ("apn", "apn"),
+                ("owner_address", "owner_address"),
+            ):
+                if regrid.get(rk) and not lead.get(lk):
+                    lead[lk] = regrid[rk]
+                    updated = True
+
             # Store all found phones/emails
             if len(enrichment.get("phones", [])) > 1:
                 lead["alt_phones"] = enrichment["phones"][1:5]
             if len(enrichment.get("emails", [])) > 1:
                 lead["alt_emails"] = enrichment["emails"][1:5]
 
-            # Phone validation metadata (consensus from Abstract + Veriphone + Cloudmersive)
+            # Phone validation metadata
             pi = enrichment.get("phone_intel")
             if pi:
                 lead["phone_carrier"] = pi.get("carrier", "")
@@ -493,10 +538,18 @@ async def enrich_batch(
                 if enrichment.get("sms_email"):
                     lead["sms_email"] = enrichment["sms_email"]
 
-            # Email validation metadata (Cloudmersive)
+            # Email validation metadata
             if "email_valid" in enrichment:
                 lead["email_valid"] = enrichment["email_valid"]
                 lead["email_disposable"] = enrichment.get("email_disposable", False)
+
+            # Persist enrichment source trail
+            if enrichment.get("sources_hit"):
+                import json as _json
+                lead["enrichment_sources"] = _json.dumps(enrichment["sources_hit"])
+
+            if enrichment.get("sms_email"):
+                lead["sms_email"] = enrichment["sms_email"]
 
             if updated:
                 stats["enriched"] += 1

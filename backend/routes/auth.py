@@ -24,7 +24,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 
-JWT_SECRET = os.getenv("JWT_SECRET", "onsite-dev-secret-change-in-production")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+if not JWT_SECRET:
+    if os.getenv("ENVIRONMENT", "production") == "production":
+        raise RuntimeError("FATAL: JWT_SECRET must be set in production")
+    JWT_SECRET = "onsite-dev-secret-MUST-SET-IN-ENV"
+    logger.warning("JWT_SECRET not set — using dev fallback")
 JWT_EXPIRY_HOURS = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
 BCRYPT_AVAILABLE = False
 
@@ -86,6 +91,7 @@ def _init_users_table():
             ("google_id", "TEXT DEFAULT ''"),
             ("google_avatar", "TEXT DEFAULT ''"),
             ("auth_provider", "TEXT DEFAULT 'email'"),
+            ("settings_json", "TEXT DEFAULT '{}'"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} {typedef}")

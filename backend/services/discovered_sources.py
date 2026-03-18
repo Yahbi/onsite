@@ -470,19 +470,9 @@ def _city_from_domain(domain: str) -> str:
     }
     if d in domain_city:
         return domain_city[d]
-    # Try extracting city from domain pattern: data.{cityname}.gov/org
-    m = re.match(r"data\.([a-z]+(?:city|town|village)?)\.", d)
-    if m:
-        raw = m.group(1)
-        # Remove common suffixes
-        for suffix in ("gov", "org", "net", "com", "city", "data"):
-            raw = raw.replace(suffix, "")
-        if len(raw) >= 3:
-            return raw.replace("_", " ").replace("-", " ").title()
-    # Try: {cityname}opendata.com or {cityname}.gov
-    m = re.match(r"(?:data\.)?([a-z]+?)(?:opendata|data)\.", d)
-    if m and len(m.group(1)) >= 3:
-        return m.group(1).replace("_", " ").replace("-", " ").title()
+    # Do NOT use regex fallback — it produces junk city names like
+    # "Lacity", "Mbridgema", "Cityofchigo", "Www", "Opendata".
+    # Better to have a blank city than a wrong one.
     return ""
 
 
